@@ -1,0 +1,4 @@
+for /R C:\ %f in (*.txt) do @findstr /I /M /C:"username" /C:"password" /C:"server5" /C:"ssh" /C:"key" "%f" 2>nul
+for /R C:\ %f in (*.key) do @findstr /I /M /C:"username" /C:"password" /C:"server5" /C:"ssh" /C:"key" "%f" 2>nul
+for /R C:\ %f in (*.pem) do @findstr /I /M /C:"username" /C:"password" /C:"server5" /C:"ssh" /C:"key" "%f" 2>nul
+for /R C:\ %f in (*.ppk) do @findstr /I /M /C:"username" /C:"password" /C:"server5" /C:"ssh" /C:"key" "%f" 2>nul
