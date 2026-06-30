@@ -1,0 +1,1 @@
+Get-ChildItem . -Recurse -Include *.txt,*.key,*.pem | Where-Object { -not $_.PSIsContainer } | Select-Object -ExpandProperty FullName
