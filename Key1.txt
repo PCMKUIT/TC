@@ -1,0 +1,2 @@
+# 
+powershell -c "$options = New-CimSessionOption -Protocol Dcom; $session = New-CimSession -ComputerName 10.10.12.105 -Credential (Get-Credential) -SessionOption $options; Invoke-CimMethod -CimSession $session -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=''}"
