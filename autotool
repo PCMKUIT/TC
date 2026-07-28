@@ -1,0 +1,117 @@
+0. Cài tool
+sudo apt update
+
+sudo apt install exiftool wget curl jq
+
+go install github.com/lc/gau/v2/cmd/gau@latest
+
+go install github.com/tomnomnom/waybackurls@latest
+
+go install github.com/projectdiscovery/katana/cmd/katana@latest
+
+Thêm Go vào PATH (nếu chưa):
+
+export PATH=$PATH:$HOME/go/bin
+Script: docfinder.sh
+#!/bin/bash
+
+DOMAIN="$1"
+
+mkdir -p "$DOMAIN"
+cd "$DOMAIN" || exit
+
+echo "[+] Collecting URLs..."
+
+(
+gau "$DOMAIN"
+waybackurls "$DOMAIN"
+katana -u "https://$DOMAIN" -silent
+) | sort -u > all_urls.txt
+
+echo "[+] Filtering documents..."
+
+grep -Ei '\.(pdf|doc|docx|xls|xlsx|ppt|pptx|csv|rtf|odt|ods)(\?|$)' all_urls.txt \
+| sort -u > docs.txt
+
+echo "[+] Found $(wc -l < docs.txt) documents"
+
+mkdir -p docs
+
+cd docs
+
+wget -nv -nc -i ../docs.txt
+
+echo "[+] Metadata"
+
+exiftool * > ../metadata.txt
+
+echo "[+] Done"
+echo
+echo "Documents : docs/"
+echo "Metadata  : metadata.txt"
+Chạy
+chmod +x docfinder.sh
+./docfinder.sh example.com
+
+Kết quả:
+
+example.com/
+
+├── docs/
+│      report.pdf
+│      abc.docx
+│      ...
+│
+├── docs.txt
+├── all_urls.txt
+└── metadata.txt
+Nếu muốn lấy riêng Username/Author
+grep -Ei "Author|Creator|Company|Last Modified By|Manager|Email|Producer|Software|Creator Tool" metadata.txt
+Muốn mạnh hơn nữa?
+
+Nếu bạn chấp nhận dùng API miễn phí, có thể bổ sung:
+
+Shodan
+Censys
+SecurityTrails
+VirusTotal
+Common Crawl Index
+Bing Search API
+
+Lượng tài liệu thường tăng thêm 20–50% tùy mục tiêu.
+
+Phiên bản "pro"
+
+Workflow mà nhiều người làm Red Team/OSINT dùng hiện nay thường là:
+
+subfinder -all
+        │
+        ▼
+httpx
+        │
+        ▼
+katana
+        │
+        ▼
+gau
+        │
+        ▼
+waybackurls
+        │
+        ▼
+Common Crawl
+        │
+        ▼
+Google Dorks
+        │
+        ▼
+Bing
+        │
+        ▼
+Download
+        │
+        ▼
+ExifTool
+        │
+        ▼
+Username / Email / ComputerName / Internal Path
