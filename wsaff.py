@@ -123,8 +123,8 @@ class Finding:
 
 @dataclass
 class CollectorResult:
-    name: str
-    status: str  # SUCCESS, LIMITED, ERROR, NOT_AVAILABLE
+    name: str = ""
+    status: str = "NOT_AVAILABLE"  # Default values added to prevent TypeError
     duration: float = 0.0
     items: List[Any] = field(default_factory=list)
     errors: int = 0
@@ -171,19 +171,15 @@ def calculate_sha256_and_entropy(path: str, max_size: int = 10 * 1024 * 1024) ->
 
         with open(path, "rb") as f:
             if size <= max_size:
-                # Read whole file
                 data = f.read()
                 sha256_hash.update(data)
                 for byte in data:
                     counts[byte] += 1
                 total_bytes = len(data)
             else:
-                # Bounded sampling: read first 2MB, middle 2MB, last 2MB for entropy
-                # Still hash the whole file for integrity if not extremely massive, 
-                # but to avoid DOS, we cap full hashing at 50MB.
                 chunk_size = 65536
                 if size > 50 * 1024 * 1024:
-                    return None, 0.0 # Skip extreme files
+                    return None, 0.0
                 
                 while chunk := f.read(chunk_size):
                     sha256_hash.update(chunk)
@@ -236,7 +232,7 @@ def extract_strings_and_iocs(path: str) -> List[str]:
     try:
         size = os.path.getsize(path)
         if size > 25 * 1024 * 1024:
-            return [] # Skip huge files
+            return []
             
         with open(path, "rb") as f:
             data = f.read()
@@ -262,7 +258,7 @@ class WSAAF:
             python_version=platform.python_version(),
             is_admin=self.is_admin
         )
-        self.cache = {} # Cache for file deep analysis
+        self.cache = {}
 
     def _setup_logger(self):
         logger = logging.getLogger("WSAAF")
@@ -284,7 +280,6 @@ class WSAAF:
         for proc in psutil.process_iter(['pid', 'ppid', 'name', 'exe', 'cmdline', 'username', 'create_time']):
             try:
                 info = proc.info
-                # Basic resource usage (skip if errors)
                 mem = None
                 cpu = None
                 try:
@@ -319,7 +314,6 @@ class WSAAF:
         errors = 0
         
         try:
-            # Resolving Process names for PIDs
             pid_map = {p.pid: p.info['name'] for p in psutil.process_iter(['pid', 'name']) if p.info['name']}
             
             for conn in psutil.net_connections(kind="inet"):
@@ -351,7 +345,6 @@ class WSAAF:
         items = []
         errors = 0
 
-        # 1. Registry (HKCU and HKLM Run/RunOnce)
         hives = [
             (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run"),
             (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\RunOnce"),
@@ -368,13 +361,12 @@ class WSAAF:
                             h_name = "HKLM" if hive == winreg.HKEY_LOCAL_MACHINE else "HKCU"
                             items.append(PersistenceItem(f"{h_name} {subkey.split('\\')[-1]}", name, str(value), True))
                         except OSError:
-                            break  # No more values
+                            break
             except FileNotFoundError:
-                pass # Key doesn't exist, normal
+                pass
             except PermissionError:
                 errors += 1
 
-        # 2. Services
         try:
             for svc in psutil.win_service_iter():
                 try:
@@ -390,7 +382,6 @@ class WSAAF:
         except Exception:
             errors += 1
 
-        # 3. Startup Folder (Current User)
         try:
             startup_path = os.path.expandvars(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup")
             if os.path.exists(startup_path):
@@ -423,7 +414,6 @@ class WSAAF:
             except Exception:
                 errors += 1
 
-        # Deduplicate names/PIDs
         for record in dll_map.values():
             record.loaded_by_pids = list(set(record.loaded_by_pids))
             record.loaded_by_names = list(set(record.loaded_by_names))
@@ -437,13 +427,11 @@ class WSAAF:
         errors = 0
 
         try:
-            # Use driverquery for clean CSV output
             cmd = ["driverquery", "/v", "/fo", "csv"]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
                 lines = result.stdout.strip().split("\n")
                 if len(lines) > 1:
-                    # header = lines[0].split(",")
                     for line in lines[1:]:
                         parts = [p.strip('"') for p in line.split('","')]
                         if len(parts) >= 12:
@@ -471,7 +459,6 @@ class WSAAF:
             return CollectorResult("Events", "LIMITED", time.time() - start_time, [], 0)
 
         try:
-            # Collect last 50 system/security events (errors/warnings)
             cmd = [
                 "powershell", "-NoProfile", "-Command",
                 "Get-WinEvent -FilterHashtable @{LogName='System','Security'; Level=1,2,3} -MaxEvents 50 -ErrorAction SilentlyContinue | Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message | ConvertTo-Json -Compress"
@@ -481,7 +468,7 @@ class WSAAF:
                 try:
                     events = json.loads(result.stdout)
                     if isinstance(events, dict):
-                        events = [events] # single event returned
+                        events = [events]
                     for e in events:
                         msg = (e.get("Message") or "")[:100].replace("\r", " ").replace("\n", " ")
                         items.append(EventRecord(
@@ -503,7 +490,7 @@ class WSAAF:
     
     def prioritize_artifacts(self) -> List[dict]:
         """Scores collected artifacts and selects candidates for deep analysis."""
-        candidates = {} # path -> {score, reasons[]}
+        candidates = {}
 
         def add_candidate(path, score, reason):
             if not path or not isinstance(path, str): return
@@ -518,7 +505,7 @@ class WSAAF:
             candidates[path_lower]["reasons"].add(reason)
 
         # 1. Evaluate Processes
-        for p in self.audit_result.collectors.get("Processes", CollectorResult("")).items:
+        for p in self.audit_result.collectors.get("Processes", CollectorResult()).items:
             exe = p.exe.lower()
             if "appdata" in exe: add_candidate(p.exe, 20, "+20 AppData executable")
             if "temp" in exe: add_candidate(p.exe, 25, "+25 Temp directory executable")
@@ -526,15 +513,14 @@ class WSAAF:
                 add_candidate(p.exe, 10, "+10 Non-standard executable path")
 
         # 2. Evaluate Persistence
-        for p in self.audit_result.collectors.get("Persistence", CollectorResult("")).items:
-            # Clean arguments from path for basic checking
+        for p in self.audit_result.collectors.get("Persistence", CollectorResult()).items:
             path = p.target_path.split(" -")[0].split(" /")[0].strip('"\'')
             add_candidate(path, 25, f"+25 Persistence target ({p.source})")
             if "appdata" in path.lower() or "temp" in path.lower():
                 add_candidate(path, 15, "+15 Suspicious persistence location")
 
         # 3. Evaluate Network Processes
-        net_procs = set([n.process_name.lower() for n in self.audit_result.collectors.get("Network", CollectorResult("")).items])
+        net_procs = set([n.process_name.lower() for n in self.audit_result.collectors.get("Network", CollectorResult()).items])
         for path_lower, data in candidates.items():
             filename = os.path.basename(path_lower)
             if filename in net_procs:
@@ -542,12 +528,11 @@ class WSAAF:
                 data["reasons"].add("+15 Network-associated process")
 
         # 4. Evaluate Drivers
-        for d in self.audit_result.collectors.get("Drivers", CollectorResult("")).items:
+        for d in self.audit_result.collectors.get("Drivers", CollectorResult()).items:
             path_lower = d.path.lower()
             if "system32\\drivers" not in path_lower and path_lower.endswith(".sys"):
                 add_candidate(d.path, 30, "+30 Non-standard driver path")
 
-        # Sort and return top candidates (Threshold > 20 or top 20 items)
         results = [{"path": v["path"], "score": v["score"], "reasons": list(v["reasons"])} for v in candidates.values()]
         results = sorted([r for r in results if r["score"] >= 20], key=lambda x: x["score"], reverse=True)[:20]
         return results
@@ -561,7 +546,6 @@ class WSAAF:
             path = cand["path"]
             path_lower = path.lower()
             
-            # Use cache if already analyzed
             meta = get_file_metadata(path)
             cache_key = f"{path_lower}_{meta['size']}_{meta['mtime']}"
             
@@ -572,7 +556,6 @@ class WSAAF:
                 self.audit_result.deep_analysis[path_lower] = analysis
                 continue
 
-            # New analysis
             sha256, entropy = calculate_sha256_and_entropy(path)
             sig_status, signer = verify_signature_powershell(path)
             iocs = extract_strings_and_iocs(path)
@@ -679,17 +662,15 @@ class WSAAF:
                 ))
                 score_deductions += 15
 
-        # Deduplicate and attach to audit result
         self.audit_result.findings = findings
         
-        # Calculate coverage
         errs = sum(1 for c in self.audit_result.collectors.values() if c.status != "SUCCESS")
         total_collectors = len(self.audit_result.collectors)
         coverage = 100
         if total_collectors > 0:
-            coverage = 100 - int((errs / total_collectors) * 35) # Max 35% penalty for missing collectors
+            coverage = 100 - int((errs / total_collectors) * 35)
         if not self.is_admin:
-            coverage = min(coverage, 65) # Admin lack caps coverage
+            coverage = min(coverage, 65)
 
         self.audit_result.audit_coverage = max(0, coverage)
         self.audit_result.security_score = max(0, 100 - score_deductions)
@@ -767,12 +748,12 @@ class WSAAF:
         print(f"Security Score: {self.audit_result.security_score}/100")
         print(f"Audit Coverage: {self.audit_result.audit_coverage}%")
         print("\nArtifacts Collected:")
-        print(f"  Processes:           {len(c.get('Processes', CollectorResult('')).items)}")
-        print(f"  Network Connections: {len(c.get('Network', CollectorResult('')).items)}")
-        print(f"  Persistence Items:   {len(c.get('Persistence', CollectorResult('')).items)}")
-        print(f"  Unique Loaded DLLs:  {len(c.get('DLLs', CollectorResult('')).items)}")
-        print(f"  Installed Drivers:   {len(c.get('Drivers', CollectorResult('')).items)}")
-        print(f"  Event Records:       {len(c.get('Events', CollectorResult('')).items)}")
+        print(f"  Processes:           {len(c.get('Processes', CollectorResult()).items)}")
+        print(f"  Network Connections: {len(c.get('Network', CollectorResult()).items)}")
+        print(f"  Persistence Items:   {len(c.get('Persistence', CollectorResult()).items)}")
+        print(f"  Unique Loaded DLLs:  {len(c.get('DLLs', CollectorResult()).items)}")
+        print(f"  Installed Drivers:   {len(c.get('Drivers', CollectorResult()).items)}")
+        print(f"  Event Records:       {len(c.get('Events', CollectorResult()).items)}")
         
         print(f"\nDeep Analysis:")
         print(f"  Analyzed Files:      {len(self.audit_result.deep_analysis)}")
@@ -791,7 +772,6 @@ class WSAAF:
     # --- Stage 8: Reporting -------------------------------------------------
 
     def generate_json_report(self, filepath: str = "wsaaf_report.json"):
-        # Convert dataclasses to dict safely
         def custom_encoder(obj):
             if hasattr(obj, '__dataclass_fields__'):
                 return asdict(obj)
