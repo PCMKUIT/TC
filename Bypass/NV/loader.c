@@ -187,16 +187,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     UNICODE_STRING imgPath;
     RtlInitUnicodeString(&imgPath, L"\\??\\C:\\Windows\\System32\\notepad.exe");
     PRTL_USER_PROCESS_PARAMETERS params = NULL;
-    NTSTATUS st = _RtlCreateProcessParametersEx(&params, &imgPath, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0);
+    NTSTATUS st = _RtlCreateProcessParametersEx(&params, &imgPath, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1);
     if (st != 0 || !params) return 8;
 
     STARTUPINFOW si = {0};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
-    RtlUserProcessParametersSetWindowStation(params, L"winsta0\\default");
-    RtlUserProcessParametersSetDesktop(params, L"Default");
-
+    params->WindowStation = L"winsta0\\default";
+    params->Desktop = L"Default";
     params->WindowFlags = STARTF_USESHOWWINDOW;
     params->ShowWindowFlags = SW_HIDE;
 
