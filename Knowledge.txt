@@ -1,0 +1,170 @@
+Trong bài viết blog **Cobalt Strike 3.3 – Now with less PowerShell.exe**, tác giả Raphael Mudge đã giới thiệu kỹ thuật **Unmanaged PowerShell** thông qua hai lệnh `powerpick` và `psinject`. Đây là giải pháp giải quyết rào cản lớn về OPSEC (Operational Security) khi thực thi các script PowerShell trong quá trình kiểm thử xâm nhập hoặc Red Teaming.
+
+---
+
+## 1. Bối cảnh & Rào cản của `powershell.exe`
+
+Trước phiên bản Cobalt Strike 3.3, khi nhà điều hành chạy lệnh `powershell [cmdlet]`, Beacon sẽ gọi trực tiếp tiến trình `powershell.exe` của hệ thống.
+
+* **Hạn chế OPSEC:** Các giải pháp phòng thủ (EDR, Antivirus, SIEM) dễ dàng phát hiện hành vi này thông qua:
+* Việc tạo mới tiến trình `powershell.exe` kèm tham số dòng lệnh bất thường (*Command-line logging / Event ID 4688*).
+* Quan hệ tiến trình Cha - Con bất thường (ví dụ: `rundll32.exe` khởi chạy `powershell.exe`).
+* Các chính sách giám sát nội bộ của PowerShell như *Script Block Logging*, *Module Logging* hoặc *Constrained Language Mode (CLM)*.
+
+
+
+---
+
+## 2. Nguyên lý kỹ thuật của Unmanaged PowerShell
+
+Nghiên cứu của Lee Christensen (*harmj0y*) và Justin Warner chỉ ra rằng: **PowerShell về bản chất là một framework dựa trên .NET Framework, chứ không chỉ đơn thuần là tập tin thực thi `powershell.exe**`.
+
+Khi chạy `powershell.exe`, hệ thống thực chất thực hiện 3 công việc:
+
+1. Nạp môi trường thực thi **.NET CLR (Common Language Runtime)**.
+2. Nạp thư viện `System.Management.Automation.dll`.
+3. Tạo một **PowerShell Runspace** để biên dịch và chạy các câu lệnh.
+
+**Unmanaged PowerShell** hoạt động bằng cách tự thực hiện 3 bước trên trực tiếp bên trong một tiến trình C/C++ (Native/Unmanaged code) thông thường mà **không bao giờ khởi chạy `powershell.exe**`.
+
+---
+
+## 3. Luồng hoạt động chi tiết của lệnh `powerpick`
+
+Khi bạn gửi lệnh `powerpick [cmdlet/script]` từ giao diện Cobalt Strike, luồng xử lý diễn ra theo các bước cụ thể:
+
+1. **Chuẩn bị Script (Tùy chọn):** Nếu trước đó bạn đã dùng lệnh `powershell-import`, nội dung mã nguồn script đã được lưu sẵn trong bộ nhớ của Cobalt Strike Team Server/Beacon.
+2. **Tạo tiến trình con (Spawnto Process):** Beacon sẽ tạo một tiến trình con tạm thời (gọi là *sacrificial process*, mặc định thường là `rundll32.exe` hoặc tiến trình được cấu hình qua lệnh `spawnto`).
+3. **Tiêm DLL Unmanaged PowerShell (Reflective DLL Injection):** Beacon tiêm thư viện DLL của Unmanaged PowerShell vào bộ nhớ của tiến trình con vừa tạo.
+4. **Khởi tạo .NET CLR & Runspace:** Mã nguồn DLL bên trong tiến trình con bắt đầu:
+* Nạp .NET CLR vào tiến trình con.
+* Sử dụng cơ chế Reflection để gọi các API thuộc namespace `System.Management.Automation`.
+* Tạo một **PowerShell Runspace** hoàn toàn ẩn trong RAM.
+
+
+5. **Thực thi & Trả kết quả:**
+* Runspace nạp các hàm đã import từ bước 1 và thực thi câu lệnh do người dùng yêu cầu.
+* Kết quả đầu ra (stdout/stderr) được thu thập qua cơ chế IPC (Named Pipes) và truyền ngược về cho Beacon theo thời gian thực (hỗ trợ cả các tác vụ chạy lâu - *long-running jobs*).
+* Tiến trình con sẽ kết thúc sau khi hoàn thành công việc.
+
+
+
+---
+
+## 4. So sánh `powershell`, `powerpick` và `psinject`
+
+| Lệnh | Tiến trình thực thi | Phương thức hoạt động | Mức độ OPSEC |
+| --- | --- | --- | --- |
+| **`powershell`** | `powershell.exe` | Chạy trực tiếp `powershell.exe` của Windows | **Thấp** (Dễ bị EDR phát hiện qua Command Line) |
+| **`powerpick`** | Tiến trình tạm (*Sacrificial process*) | Spawn tiến trình con ngụy trang -> Inject Unmanaged PowerShell DLL | **Trung bình - Cao** (Bỏ qua việc tạo `powershell.exe`) |
+| **`psinject`** | Tiến trình chỉ định (PID có sẵn) | Inject Unmanaged PowerShell DLL trực tiếp vào một PID đang chạy | **Cao** (Không tạo tiến trình mới, ẩn mình trong tiến trình hợp lệ) |
+
+---
+
+## 5. Góc nhìn Phòng thủ (Blue Team Detection)
+
+Mặc dù `powerpick` giúp tránh được các quy tắc phát hiện dựa trên `powershell.exe`, hành vi này vẫn để lại các dấu vết đặc trưng:
+
+* **Dấu vết nạp .NET bất thường (Unmanaged .NET Loading):** Một tiến trình Native vốn không phải .NET (như `rundll32.exe`, `svchost.exe`) đột ngột nạp các DLL của .NET CLR (`clr.dll`, `mscoree.dll`) và `System.Management.Automation.dll`.
+* **Hành vi tiêm bộ nhớ (Process Injection):** EDR có thể gắn cờ hành vi tạo luồng dữ liệu (Thread) và ghi bộ nhớ cross-process từ Beacon vào tiến trình con.
+* **AMSI & ETW:** Trên các phiên bản Windows hiện đại, AMSI (*Antimalware Scan Interface*) và ETW (*Event Tracing for Windows*) vẫn có thể soi chiếu vào nội dung thực thi bên trong .NET Runspace dù không có `powershell.exe`.
+
+
+Kỹ thuật **`execute-assembly`** (được giới thiệu từ Cobalt Strike 3.11) là một trong những tính năng đột phá nhất dành cho Red Team. Nó cho phép nhà điều hành thực thi các tập tin dạng assembly của .NET (`.exe` biên dịch bằng C# như *Rubeus, Seatbelt, SharpUp, BloodHound/SharpHound*) trực tiếp trong bộ nhớ của máy nạn nhân mà **không cần ghi tập tin xuống đĩa (diskless/in-memory execution)**.
+
+---
+
+## 1. Bối cảnh & Mục đích ra đời
+
+Trước đây, để chạy một công cụ C# trên máy mục tiêu, nhà điều hành có 2 lựa chọn:
+
+* **Tải `.exe` lên đĩa:** Dễ bị Antivirus/EDR quét đĩa (Static Analysis) phát hiện ngay lập tức.
+* **Chuyển đổi script C# sang PowerShell:** Chạy qua `powerpick` hoặc `powershell.exe`. Tuy nhiên, việc này tốn công chuyển đổi mã nguồn và dễ bị vướng AMSI/Script Block Logging của PowerShell.
+
+`execute-assembly` giải quyết triệt để vấn đề này bằng cách kết hợp cơ chế **Fork-and-Run** và **CLR Hosting**.
+
+---
+
+## 2. Nguyên lý kỹ thuật: Host .NET CLR trong Unmanaged Process
+
+Tương tự như `powerpick`, `execute-assembly` dựa trên thực tế là: **Mã .NET (Managed Code) không thể tự chạy nếu thiếu môi trường thực thi .NET CLR (Common Language Runtime)**.
+
+Cobalt Strike sử dụng các API COM không công khai/chính thức của Microsoft (`ICLRMetaHost`, `ICLRRuntimeInfo`, `ICLRRuntimeHost`) để nạp thủ công engine CLR vào bên trong một tiến trình C/C++ chuẩn (Native/Unmanaged Process). Khi CLR đã chạy bên trong tiến trình đó, nó có thể nhận mảng byte đại diện cho tập tin `.exe` .NET từ bộ nhớ và cho thực thi.
+
+---
+
+## 3. Luồng hoạt động chi tiết của `execute-assembly`
+
+Khi người dùng thực thi lệnh `execute-assembly /path/to/tool.exe [arguments]` trên Beacon:
+
+1. **Chuẩn bị Assembly trên Team Server:**
+* Team Server đọc file `.exe` C# từ máy của Operator, đọc mảng byte (raw bytes) của file và chuẩn bị gửi qua kênh C2 xuống Beacon.
+
+
+2. **Tạo tiến trình con - Fork-and-Run (Sacrificial Process):**
+* Beacon khởi tạo một tiến trình con tạm thời ở trạng thái bị hoãn (`CREATE_SUSPENDED`). Tiến trình này được xác định bởi cấu hình `spawnto` (mặc định thường là `rundll32.exe`, `werfault.exe` hoặc `notepad.exe`).
+
+
+3. **Inject Unmanaged .NET Loader DLL:**
+* Beacon sử dụng kỹ thuật **Reflective DLL Injection**:
+* Cấp phát bộ nhớ (`VirtualAllocEx`) trong tiến trình con.
+* Ghi thư viện DLL Loader của Cobalt Strike (`WriteProcessMemory`) vào tiến trình con.
+* Tạo một luồng thực thi mới (`CreateRemoteThread` hoặc Hijack Thread) để chạy DLL Loader vừa tiêm.
+
+
+
+
+4. **Khởi tạo .NET CLR (CLR Hosting):**
+* Mã nguồn trong DLL Loader tỉnh dậy bên trong tiến trình con và gọi các COM Interface để nạp .NET Framework:
+* `CLRCreateInstance()` để lấy interface `ICLRMetaHost`.
+* `GetRuntime()` để xác định phiên bản .NET phù hợp (v2.0 hoặc v4.0).
+* `GetInterface()` để lấy `ICLRRuntimeHost` hoặc `ICorRuntimeHost`.
+* Gọi hàm `Start()` để khởi động engine .NET CLR ngay trong RAM của tiến trình con.
+
+
+
+
+5. **Nạp & Thực thi Assembly trong RAM:**
+* DLL Loader nhận mảng byte của file C# `.exe` (được Beacon truyền sang).
+* Thông qua CLR, nó gọi hàm `Assembly.Load(byte[])` (hoặc cấp độ thấp hơn qua `AppDomain`) để nạp file C# thẳng vào bộ nhớ mà **không chạm xuống đĩa**.
+* Hệ thống tìm kiếm hàm lối vào `Main()` của Assembly và gọi nó kèm theo các tham số (arguments) mà Operator truyền vào.
+
+
+6. **Thu thập kết quả (IPC Pipe Redirect):**
+* Luồng đầu ra tiêu chuẩn (`stdout`/`stderr`) của tiến trình con đã được Beacon móc (hook) hoặc chuyển hướng qua **Named Pipes**.
+* Mọi dữ liệu mà công cụ C# in ra màn hình sẽ được gửi ngược về Beacon theo thời gian thực và hiển thị trên Cobalt Strike console.
+
+
+7. **Dọn dẹp tiến trình:**
+* Khi hàm `Main()` của công cụ .NET kết thúc, tiến trình con tự động thoát (`ExitProcess`). Mọi dấu vết bộ nhớ, thư viện .NET đã nạp đều biến mất cùng tiến trình đó.
+
+
+
+---
+
+## 4. So sánh `execute-assembly` và `powerpick`
+
+| Đặc tính | `execute-assembly` | `powerpick` |
+| --- | --- | --- |
+| **Mục tiêu thực thi** | Các file `.exe` / `.dll` viết bằng C# / .NET | Các câu lệnh, cmdlet, script PowerShell (`.ps1`) |
+| **Môi trường nạp** | Tự nạp .NET CLR để chạy Assembly C# | Nạp .NET CLR + `System.Management.Automation.dll` để tạo PowerShell Runspace |
+| **Mô hình thực thi** | Fork-and-Run (Mở tiến trình con) | Fork-and-Run (Mở tiến trình con) |
+| **Độ phụ thuộc đĩa** | **0%** (Tập tin `.exe` C# nằm hoàn toàn trên RAM) | **0%** (Script được truyền qua RAM) |
+
+---
+
+## 5. Góc nhìn Phòng thủ (Blue Team Detection)
+
+Dù `execute-assembly` rất mạnh mẽ để qua mặt các AV quét file trên đĩa, EDR hiện đại giám sát rất kỹ kỹ thuật này thông qua các chỉ số nguy cơ (IOCs):
+
+* **Hành vi Fork-and-Run & Process Injection:**
+* Việc tạo một tiến trình ngắn hạn như `rundll32.exe` hoặc `notepad.exe` rồi tiêm mã từ tiến trình khác vào (với các quyền bộ nhớ như `PAGE_EXECUTE_READWRITE`) là cờ đỏ rất rõ ràng.
+
+
+* **Tiến trình Unmanaged nạp .NET (CLR Loading Anomaly):**
+* EDR giám sát sự kiện DLL Load: Nếu một tiến trình chuẩn của Windows như `notepad.exe` đột ngột nạp `clr.dll`, `mscoree.dll`, `clrjit.dll`, EDR sẽ gắn cờ cảnh báo "Unmanaged process loading .NET".
+
+
+* **AMSI & ETW cho .NET (Windows 10 / Server 2019+):**
+* Từ .NET Framework 4.8, Microsoft đã tích hợp **AMSI** trực tiếp vào CLR. Ngay khi `Assembly.Load()` được gọi trong RAM, AMSI vẫn có thể quét mảng byte đó trước khi thực thi.
+* Tracing qua **ETW (Event Tracing for Windows)** cho phép SOC/EDR ghi lại chính xác tên Assembly, AppDomain, và các hàm được nạp trong bộ nhớ.
