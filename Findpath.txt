@@ -1,0 +1,896 @@
+Được. Dưới đây là bộ lệnh Windows PowerShell tương ứng, lấy ví dụ thư mục gốc là C:\Users. Tất cả đều trả về đường dẫn tuyệt đối.
+
+1. Tên file có chứa apache
+
+apache, libapache, apachev2, myapache.txt → đều match.
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like '*apache*' } |
+    Select-Object -ExpandProperty FullName
+
+Không phân biệt hoa/thường mặc định trong PowerShell.
+
+
+---
+
+2. Tên file bắt đầu bằng apache
+
+apache → ✅
+apachev2 → ✅
+apache.txt → ✅
+libapache → ❌
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like 'apache*' } |
+    Select-Object -ExpandProperty FullName
+
+
+---
+
+3. Tên file kết thúc bằng apache
+
+apache → ✅
+libapache → ✅
+libapache.txt → ❌
+apachev2 → ❌
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like '*apache' } |
+    Select-Object -ExpandProperty FullName
+
+Nếu muốn extension không tính
+
+Tức:
+
+libapache.txt  → ✅
+apache.conf    → ✅
+apachev2.txt   → ❌
+libapache.log  → ✅
+
+thì dùng BaseName:
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.BaseName -like '*apache' } |
+    Select-Object -ExpandProperty FullName
+
+BaseName là tên không bao gồm extension.
+
+
+---
+
+4. Tên chính xác là apache
+
+Chính xác cả extension
+
+Chỉ:
+
+apache
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -eq 'apache' } |
+    Select-Object -ExpandProperty FullName
+
+Không match:
+
+apache.txt
+apache.conf
+apachev2
+libapache
+
+Tên trước extension chính xác là apache
+
+apache.txt    → ✅
+apache.conf   → ✅
+apache.exe    → ✅
+apachev2.txt  → ❌
+libapache.txt → ❌
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.BaseName -eq 'apache' } |
+    Select-Object -ExpandProperty FullName
+
+
+---
+
+5. Tìm theo ngày
+
+Windows có nhiều timestamp đáng chú ý:
+
+CreationTime       = ngày tạo
+LastWriteTime      = lần chỉnh sửa cuối
+LastAccessTime     = lần truy cập cuối
+
+File được tạo trong khoảng thời gian
+
+Ví dụ từ 01/09/2026 đến 05/09/2026:
+
+$start = Get-Date '2026-09-01 00:00:00'
+$end   = Get-Date '2026-09-06 00:00:00'
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.CreationTime -ge $start -and
+        $_.CreationTime -lt $end
+    } |
+    Select-Object -ExpandProperty FullName
+
+Tôi dùng ngày 06/09 làm mốc kết thúc để lấy trọn ngày 05/09.
+
+
+---
+
+File được chỉnh sửa trong khoảng thời gian
+
+$start = Get-Date '2026-09-01 00:00:00'
+$end   = Get-Date '2026-09-06 00:00:00'
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.LastWriteTime -ge $start -and
+        $_.LastWriteTime -lt $end
+    } |
+    Select-Object -ExpandProperty FullName
+
+
+---
+
+Vừa tạo trong khoảng A → B, vừa sửa trong khoảng C → D
+
+Ví dụ:
+
+> Tạo từ 1–5/9 và đồng thời sửa từ 10–20/9.
+
+
+
+$createStart = Get-Date '2026-09-01'
+$createEnd   = Get-Date '2026-09-06'
+
+$modifyStart = Get-Date '2026-09-10'
+$modifyEnd   = Get-Date '2026-09-21'
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.CreationTime -ge $createStart -and
+        $_.CreationTime -lt $createEnd -and
+        $_.LastWriteTime -ge $modifyStart -and
+        $_.LastWriteTime -lt $modifyEnd
+    } |
+    Select-Object -ExpandProperty FullName
+
+
+---
+
+File được sửa trong 7 ngày gần nhất
+
+$since = (Get-Date).AddDays(-7)
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -ge $since } |
+    Select-Object -ExpandProperty FullName
+
+
+---
+
+6. List theo extension
+
+.txt
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -Filter '*.txt' -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty FullName
+
+.exe
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -Filter '*.exe' -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty FullName
+
+Nhiều extension
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Extension -in '.txt','.log','.conf','.ini' } |
+    Select-Object -ExpandProperty FullName
+
+Không có extension
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Extension -eq '' } |
+    Select-Object -ExpandProperty FullName
+
+
+---
+
+7. List theo kích thước
+
+Lớn hơn 100 MB
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Length -gt 100MB } |
+    Select-Object -ExpandProperty FullName
+
+Nhỏ hơn 1 MB
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Length -lt 1MB } |
+    Select-Object -ExpandProperty FullName
+
+Từ 10 MB đến 100 MB
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Length -ge 10MB -and
+        $_.Length -le 100MB
+    } |
+    Select-Object -ExpandProperty FullName
+
+
+---
+
+8. List theo permission
+
+Windows dùng NTFS ACL, không dùng chmod 755, 777 như Linux.
+
+Xem permission của một file:
+
+Get-Acl 'C:\Users\User\file.txt'
+
+Muốn list path + permission:
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        $acl = Get-Acl $_.FullName
+        [PSCustomObject]@{
+            Path = $_.FullName
+            Owner = $acl.Owner
+            Access = $acl.Access
+        }
+    }
+
+Tìm file có ACL chứa Everyone
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        $path = $_.FullName
+        $acl = Get-Acl $path
+
+        if ($acl.Access.IdentityReference -match 'Everyone') {
+            $path
+        }
+    }
+
+Tìm file mà user/group có quyền Write
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        $acl = Get-Acl $_.FullName
+
+        if ($acl.Access.FileSystemRights -match 'Write') {
+            $_.FullName
+        }
+    }
+
+
+---
+
+9. List file hidden
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Attributes -band [IO.FileAttributes]::Hidden } |
+    Select-Object -ExpandProperty FullName
+
+System files
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Attributes -band [IO.FileAttributes]::System } |
+    Select-Object -ExpandProperty FullName
+
+Hidden + System
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object {
+        ($_.Attributes -band [IO.FileAttributes]::Hidden) -or
+        ($_.Attributes -band [IO.FileAttributes]::System)
+    } |
+    Select-Object -ExpandProperty FullName
+
+
+---
+
+10. List theo owner
+
+Ví dụ file thuộc Administrators:
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        $acl = Get-Acl $_.FullName
+
+        if ($acl.Owner -match 'Administrators') {
+            $_.FullName
+        }
+    }
+
+
+---
+
+11. List theo thư mục sâu bao nhiêu cấp
+
+Chỉ C:\Users:
+
+Get-ChildItem 'C:\Users' -File
+
+Lưu ý: PowerShell Get-ChildItem không có -MaxDepth trên một số phiên bản Windows PowerShell cũ. Với PowerShell 7 thì có:
+
+Get-ChildItem 'C:\Users' -File -Recurse -Depth 2
+
+
+---
+
+12. Kết hợp nhiều điều kiện
+
+Ví dụ:
+
+> Từ C:\Users, tìm file có chữ apache, .conf, lớn hơn 1 KB và được sửa trong 30 ngày.
+
+
+
+$since = (Get-Date).AddDays(-30)
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Name -like '*apache*' -and
+        $_.Extension -eq '.conf' -and
+        $_.Length -gt 1KB -and
+        $_.LastWriteTime -ge $since
+    } |
+    Select-Object -ExpandProperty FullName
+
+
+---
+
+13. Những thứ khác Windows có thể lọc
+
+Ngoài 7 cái ban đầu, PowerShell còn lọc được:
+
+Tiêu chí	Property
+
+Tên	.Name
+Tên không extension	.BaseName
+Extension	.Extension
+Đường dẫn tuyệt đối	.FullName
+Kích thước	.Length
+Ngày tạo	.CreationTime
+Ngày sửa	.LastWriteTime
+Ngày truy cập	.LastAccessTime
+Owner	Get-Acl
+Permission	Get-Acl
+Hidden	.Attributes
+System	.Attributes
+Read-only	.IsReadOnly
+File	-File
+Folder	-Directory
+Symbolic link	.LinkType
+Số lượng hard link	filesystem/API-specific
+Hash	Get-FileHash
+
+
+Ví dụ tìm file read-only:
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.IsReadOnly } |
+    Select-Object -ExpandProperty FullName
+
+Tìm file theo SHA256:
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        $hash = Get-FileHash $_.FullName -Algorithm SHA256 -ErrorAction SilentlyContinue
+
+        if ($hash.Hash -eq 'HASH_CẦN_TÌM') {
+            $_.FullName
+        }
+    }
+
+
+---
+
+Cheat sheet ngắn nhất
+
+Nếu bạn chỉ cần nhớ cú pháp Windows thì nhớ:
+
+Get-ChildItem PATH
+        │
+        ├── -File
+        ├── -Directory
+        ├── -Recurse
+        ├── -Force
+        └── -Filter
+
+Where-Object { ĐIỀU_KIỆN }
+
+Select-Object -ExpandProperty FullName
+
+Ví dụ tìm mọi file từ C:\Users có apache trong tên và in absolute path:
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like '*apache*' } |
+    Select-Object -ExpandProperty FullName
+
+Đổi C:\Users thành C:\ là tìm toàn bộ ổ C::
+
+Get-ChildItem 'C:\' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like '*apache*' } |
+    Select-Object -ExpandProperty FullName
+
+-ErrorAction SilentlyContinue rất hữu ích khi quét C:\ vì Windows có rất nhiều thư mục bạn không có quyền truy cập.
+
+
+
+
+Được. Nếu mục tiêu là tìm file và in ra đường dẫn tuyệt đối, thì find trên Linux/Kali và PowerShell trên Windows là 2 nhóm lệnh chính.
+
+> Lưu ý: với Windows, nên dùng PowerShell thay vì cmd vì lọc theo thời gian, extension, thuộc tính… dễ hơn.
+
+
+
+1. Tìm tên file có chứa apache
+
+Kali / Linux
+
+find /usr/share -type f -iname '*apache*' -print
+
+Ví dụ có thể ra:
+
+/usr/share/doc/apache2/README
+/usr/share/libapachev2/test.conf
+/usr/share/apache/test.txt
+
+*apache* nghĩa là apache xuất hiện ở bất kỳ vị trí nào trong tên file.
+
+Nếu phân biệt hoa/thường:
+
+find /usr/share -type f -name '*apache*'
+
+Windows PowerShell
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like '*apache*' } |
+    Select-Object -ExpandProperty FullName
+
+
+---
+
+2. Tên file bắt đầu bằng apache
+
+apache được phép, apachev2 được phép, nhưng libapachev2 không.
+
+Kali
+
+find /usr/share -type f -iname 'apache*' -print
+
+Windows
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like 'apache*' } |
+    Select-Object -ExpandProperty FullName
+
+
+---
+
+3. Tên file kết thúc bằng apache
+
+libapache → được
+apache → được
+apachev2 → không
+
+Kali
+
+find /usr/share -type f -iname '*apache' -print
+
+Windows
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like '*apache' } |
+    Select-Object -ExpandProperty FullName
+
+Extension có được tính không?
+
+Có một điểm quan trọng: find đang so sánh toàn bộ tên file, bao gồm cả extension.
+
+Ví dụ:
+
+/usr/share/foo/apache.txt
+
+Tên file thực tế là apache.txt, nên:
+
+find /usr/share -type f -name '*apache'
+
+không match.
+
+Nếu muốn "tên trước extension kết thúc bằng apache", ví dụ libapache.txt được nhưng apachev2.txt không, có thể làm:
+
+find /usr/share -type f -printf '%f\n' | grep -E '(^|[^a-zA-Z])apache(\.[^.]+)?$'
+
+Nhưng nếu cần in absolute path, dùng:
+
+find /usr/share -type f -print0 |
+while IFS= read -r -d '' f; do
+    name=$(basename "$f")
+    [[ "$name" =~ apache(\.[^.]*)?$ ]] && printf '%s\n' "$f"
+done
+
+
+---
+
+4. Tên file chính xác là apache, không tính extension
+
+Ý bạn là:
+
+apache       → OK
+apache.txt   → KHÔNG
+apache.conf  → KHÔNG
+libapache    → KHÔNG
+apachev2     → KHÔNG
+
+Kali
+
+find /usr/share -type f -name 'apache' -print
+
+Đây chính xác là trường hợp trên.
+
+Windows
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.BaseName -eq 'apache' -and $_.Extension -eq '' } |
+    Select-Object -ExpandProperty FullName
+
+Nếu bạn muốn apache.txt cũng được coi là tên apache, thì Windows:
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.BaseName -eq 'apache' } |
+    Select-Object -ExpandProperty FullName
+
+Linux thì có thể:
+
+find /usr/share -type f -printf '%p\n' |
+while IFS= read -r f; do
+    [[ "$(basename "${f%.*}")" == "apache" ]] && printf '%s\n' "$f"
+done
+
+
+---
+
+5. Tìm theo thời gian
+
+Đây là phần find rất mạnh trên Kali.
+
+5.1. File được chỉnh sửa trong X ngày gần đây
+
+Ví dụ 7 ngày gần nhất:
+
+find /usr/share -type f -mtime -7 -print
+
+-mtime -7 = modified time trong vòng 7 ngày.
+
+Chính xác khoảng thời gian
+
+Ví dụ từ 01/09/2026 đến 05/09/2026:
+
+find /usr/share -type f \
+    -newermt '2026-09-01 00:00:00' \
+    ! -newermt '2026-09-06 00:00:00' \
+    -print
+
+Cách này rất tiện vì:
+
+>= 01/09 00:00
+<  06/09 00:00
+
+tức là bao trọn ngày 05/09.
+
+
+---
+
+5.2. Tìm theo ngày tạo
+
+Linux/Kali hơi khác Windows.
+
+Không phải filesystem Linux nào cũng lưu creation/birth time. Nếu filesystem có birth time, có thể dùng:
+
+find /usr/share -type f -newermt '2026-09-01' ! -newermt '2026-09-06' -print
+
+Nhưng cái này mặc định là mtime, không phải creation time.
+
+Để kiểm tra birth time của một file:
+
+stat /path/to/file
+
+Nếu thấy:
+
+Birth: 2026-09-02 ...
+
+thì filesystem có thông tin creation/birth.
+
+Muốn lọc Birth time thực sự, thường phải dùng stat/script vì find không có một predicate birth-time portable như -mtime.
+
+Ví dụ:
+
+find /usr/share -type f -exec stat --format='%W %n' {} + |
+awk '$1 >= 1756684800 && $1 < 1757116800 {print substr($0,index($0,$2))}'
+
+Phần timestamp ở đây là Unix timestamp nên thường nên chuyển khoảng ngày của bạn sang timestamp.
+
+
+---
+
+6. List theo extension
+
+Kali
+
+Tất cả .conf:
+
+find /usr/share -type f -iname '*.conf' -print
+
+.txt:
+
+find /usr/share -type f -iname '*.txt' -print
+
+Nhiều extension:
+
+find /usr/share -type f \( -iname '*.txt' -o -iname '*.conf' -o -iname '*.log' \) -print
+
+Không quan tâm hoa/thường:
+
+find /usr/share -type f -iname '*.PDF' -print
+
+-iname sẽ match cả:
+
+test.pdf
+test.PDF
+test.Pdf
+
+Windows
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Extension -eq '.txt' } |
+    Select-Object -ExpandProperty FullName
+
+Nhiều extension:
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Extension -in '.txt','.log','.conf' } |
+    Select-Object -ExpandProperty FullName
+
+
+---
+
+7. List theo permission
+
+Phần này Linux mạnh hơn Windows.
+
+7.1. File có permission chính xác 777
+
+find /usr/share -type f -perm 0777 -print
+
+7.2. File có world-writable
+
+find /usr/share -type f -perm -0002 -print
+
+Tức là:
+
+other có quyền write
+
+7.3. File executable
+
+find /usr/share -type f -perm /111 -print
+
+7.4. File readable bởi mọi user
+
+find /usr/share -type f -perm -004 -print
+
+7.5. Tìm SUID
+
+find /usr -type f -perm -4000 -print
+
+7.6. Tìm SGID
+
+find /usr -type f -perm -2000 -print
+
+7.7. File thuộc user cụ thể
+
+Ví dụ root:
+
+find /usr/share -type f -user root -print
+
+Theo group:
+
+find /usr/share -type f -group root -print
+
+
+---
+
+Windows — lọc permission
+
+Windows không dùng rwx như Linux mà dùng ACL.
+
+Có thể xem quyền:
+
+Get-Acl 'C:\Users\username\file.txt'
+
+Tìm file mà ACL có quyền Everyone chẳng hạn thì có thể kết hợp:
+
+Get-ChildItem 'C:\Users' -File -Recurse -Force -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        $acl = Get-Acl $_.FullName -ErrorAction SilentlyContinue
+
+        if ($acl.Access.IdentityReference -match 'Everyone') {
+            $_.FullName
+        }
+    }
+
+
+---
+
+8. Các kiểu lọc khác rất đáng biết
+
+Thực ra find có thể lọc rất nhiều thứ, không chỉ 7 loại trên.
+
+Theo kích thước
+
+File lớn hơn 100 MB:
+
+find /usr/share -type f -size +100M -print
+
+Nhỏ hơn 1 MB:
+
+find /usr/share -type f -size -1M -print
+
+Khoảng 10–100 MB:
+
+find /usr/share -type f -size +10M -size -100M -print
+
+
+---
+
+Theo loại filesystem object
+
+File thường:
+
+find /usr/share -type f
+
+Directory:
+
+find /usr/share -type d
+
+Symbolic link:
+
+find /usr/share -type l
+
+Socket:
+
+find /usr -type s
+
+
+---
+
+Theo owner
+
+find / -type f -user root -print 2>/dev/null
+
+Theo group:
+
+find / -type f -group root -print 2>/dev/null
+
+
+---
+
+Theo inode
+
+find /usr/share -type f -inum 123456 -print
+
+
+---
+
+Theo số hard link
+
+find /usr/share -type f -links +1 -print
+
+
+---
+
+Theo depth
+
+Chỉ tìm trực tiếp trong /usr/share, không đi sâu:
+
+find /usr/share -maxdepth 1 -type f -print
+
+Tìm sâu tối đa 3 cấp:
+
+find /usr/share -maxdepth 3 -type f -print
+
+
+---
+
+Tìm tên nhưng bỏ qua một số thư mục
+
+Ví dụ tìm apache nhưng bỏ /usr/share/doc:
+
+find /usr/share \
+    -path '/usr/share/doc' -prune -o \
+    -type f -iname '*apache*' -print
+
+
+---
+
+9. Kết hợp nhiều điều kiện
+
+Đây mới là phần rất hữu ích.
+
+Ví dụ:
+
+> Từ /usr/share, tìm file có chữ apache, extension .conf, lớn hơn 1 KB và được sửa trong 30 ngày gần đây.
+
+
+
+find /usr/share -type f \
+    -iname '*apache*.conf' \
+    -size +1k \
+    -mtime -30 \
+    -print
+
+Hoặc:
+
+> Tìm file bắt đầu bằng apache, .log, lớn hơn 10 MB.
+
+
+
+find /var -type f \
+    -iname 'apache*.log' \
+    -size +10M \
+    -print
+
+Hoặc:
+
+> File chính xác tên apache, owner root, executable.
+
+
+
+find /usr -type f \
+    -name 'apache' \
+    -user root \
+    -perm /111 \
+    -print
+
+
+---
+
+10. Một bảng "cheat sheet" nhanh
+
+Muốn tìm	Kali/Linux
+
+Có chứa apache	find A -type f -iname '*apache*'
+Bắt đầu apache	find A -type f -iname 'apache*'
+Kết thúc apache	find A -type f -iname '*apache'
+Chính xác apache	find A -type f -name 'apache'
+Extension .txt	find A -type f -iname '*.txt'
+Sửa trong 7 ngày	find A -type f -mtime -7
+Sửa trước 7 ngày	find A -type f -mtime +7
+Lớn hơn 100 MB	find A -type f -size +100M
+Nhỏ hơn 1 MB	find A -type f -size -1M
+Executable	find A -type f -perm /111
+World writable	find A -type f -perm -0002
+Permission 777	find A -type f -perm 0777
+SUID	find A -type f -perm -4000
+Owner root	find A -type f -user root
+Group root	find A -type f -group root
+Chỉ directory	find A -type d
+Chỉ symlink	find A -type l
+Depth tối đa 2	find A -maxdepth 2 -type f
+
+
+Trong đó A chính là đường dẫn gốc, ví dụ:
+
+find /usr/share ...
+
+hoặc:
+
+Get-ChildItem 'C:\Users' ...
+
+Mẹo quan trọng: trên Linux, find vốn đã trả về path dựa trên A. Nếu A là absolute path như /usr/share thì kết quả là absolute path. Trên PowerShell, FullName đảm bảo lấy absolute path.
