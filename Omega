@@ -1,0 +1,449 @@
+# Rclone + MEGA + Google Drive — Hướng dẫn từng bước
+
+Bạn đã làm SFTP (LAN) rồi, giờ chuyển sang **cloud** (MEGA, Google Drive). Khác biệt chính:
+
+| | SFTP (LAN) | Cloud (MEGA, Drive) |
+|---|---|---|
+| **Giao thức** | SSH/SFTP | HTTPS API |
+| **Port** | 22 | 443 |
+| **Server** | Máy bạn tự dựng | Nhà cung cấp |
+| **Auth** | user/pass SSH | Email + password + 2FA |
+| **Config** | host/user/pass | OAuth token hoặc user/pass |
+| **Cần Internet?** | Không (cùng LAN) | ✅ Bắt buộc |
+
+---
+
+## PHẦN 1: MEGA — CÁC BƯỚC
+
+### 1.1 Đăng ký MEGA
+
+1. Vào https://mega.nz/register
+2. Nhập **email + password** (nhớ kỹ — dùng cho rclone)
+3. Xác nhận email
+4. Gói **Free 20GB** là đủ demo. Muốn nhiều hơn → MEGA Pro.
+
+**Lưu ý:** MEGA có **2 lớp password**:
+- **Password đăng nhập** (login) — dùng cho web
+- **Encryption key** (mã hóa) — dùng để giải mã file
+
+→ **rclone cần cả 2** (hoặc password + key). Nếu quên key → mất dữ liệu.
+
+### 1.2 Cấu hình rclone với MEGA
+
+**Cách 1: Tương tác (khuyến nghị lần đầu)**
+
+```powershell
+cd C:\rclone
+.\rclone.exe config
+```
+
+Chọn:
+```
+n) New remote
+name> mega
+Storage> mega          (gõ "mega" hoặc số tương ứng)
+user> your-email@gmail.com
+y) Yes type in my own password
+password> <password MEGA>
+pass> <nhập lại>
+y) Yes this is OK
+q) Quit config
+```
+
+**Cách 2: 1 lệnh**
+
+```powershell
+.\rclone.exe config create mega mega `
+  user=your-email@gmail.com `
+  pass=$(.\rclone.exe obscure "MatKhauMEGA")
+```
+
+### 1.3 Test kết nối
+
+```powershell
+# Liệt kê file trên MEGA
+.\rclone.exe lsd mega:
+
+# Xem dung lượng
+.\rclone.exe about mega:
+```
+
+Nếu thấy thông tin → **OK**.
+
+### 1.4 Đẩy file lên MEGA
+
+```powershell
+# Đẩy 1 file
+.\rclone.exe copy "D:\data\bigfile.7z" mega:/backup/ --progress
+
+# Đẩy cả thư mục
+.\rclone.exe copy "D:\data\" mega:/backup/ --progress
+
+# Đẩy + kiểm tra
+.\rclone.exe copy "D:\data\bigfile.7z" mega:/backup/ `
+  --progress --checksum --transfers 4
+```
+
+### 1.5 Kéo file từ MEGA về
+
+```powershell
+# Kéo 1 file
+.\rclone.exe copy mega:/backup/bigfile.7z "D:\download\" --progress
+
+# Kéo cả thư mục
+.\rclone.exe copy mega:/backup/ "D:\download\" --progress
+
+# Đồng bộ (xóa file thừa ở đích)
+.\rclone.exe sync mega:/backup/ "D:\download\" --progress
+```
+
+### 1.6 Lưu ý về MEGA
+
+| Đặc điểm | Chi tiết |
+|---|---|
+| **Giao thức** | HTTPS API (port 443) |
+| **Mã hóa** | MEGA tự mã hóa **end-to-end** — server MEGA cũng không đọc được |
+| **In-transit** | HTTPS (TLS) |
+| **At-rest** | MEGA mã hóa trước khi lưu |
+| **Tốc độ** | Free bị giới hạn (thường ~10-30MB/s, tùy giờ) |
+| **Hạn mức** | Free có **transfer quota** — đẩy quá nhiều sẽ bị chặn tạm |
+| **rclone remote** | `mega:` |
+
+**Quan trọng:** MEGA đã mã hóa sẵn — **không cần `rclone crypt`** thêm (nhưng vẫn có thể dùng nếu muốn).
+
+---
+
+## PHẦN 2: GOOGLE DRIVE — CÁC BƯỚC
+
+### 2.1 Đăng ký Google
+
+1. Vào https://accounts.google.com/signup
+2. Tạo Gmail (nếu chưa có)
+3. Google Drive Free **15GB** (dùng chung với Gmail, Photos)
+
+### 2.2 Cấu hình rclone với Google Drive
+
+**Đây là phần phức tạp nhất** — vì Google dùng **OAuth2**, cần tạo app hoặc dùng app có sẵn của rclone.
+
+**Cách 1: Dùng app có sẵn của rclone (dễ nhất, cho lab)**
+
+```powershell
+.\rclone.exe config
+```
+
+Chọn:
+```
+n) New remote
+name> gdrive
+Storage> drive          (Google Drive)
+client_id>              (Enter — dùng app mặc định của rclone)
+client_secret>          (Enter)
+scope> 1                (Full access)
+root_folder_id>         (Enter)
+service_account_file>   (Enter)
+Edit advanced config? n
+Use auto config? y
+```
+
+→ **Browser sẽ mở** → đăng nhập Google → **Allow** → token lưu vào config.
+
+```powershell
+y) Yes this is OK
+q) Quit config
+```
+
+**Cách 2: Tạo app riêng (cho production, tránh bị rate limit)**
+
+1. Vào https://console.cloud.google.com/
+2. Tạo project mới
+3. **APIs & Services** → **Enable APIs** → bật **Google Drive API**
+4. **Credentials** → **Create Credentials** → **OAuth client ID**
+5. Chọn **Desktop app**
+6. Lấy **Client ID** + **Client Secret**
+7. Dùng trong `rclone config` ở bước `client_id` + `client_secret`
+
+### 2.3 Test kết nối
+
+```powershell
+.\rclone.exe lsd gdrive:
+.\rclone.exe about gdrive:
+```
+
+### 2.4 Đẩy file lên Google Drive
+
+```powershell
+.\rclone.exe copy "D:\data\bigfile.7z" gdrive:/backup/ --progress
+
+# Đẩy cả thư mục
+.\rclone.exe copy "D:\data\" gdrive:/backup/ --progress
+```
+
+### 2.5 Kéo file từ Google Drive về
+
+```powershell
+.\rclone.exe copy gdrive:/backup/bigfile.7z "D:\download\" --progress
+.\rclone.exe copy gdrive:/backup/ "D:\download\" --progress
+```
+
+### 2.6 Lưu ý về Google Drive
+
+| Đặc điểm | Chi tiết |
+|---|---|
+| **Giao thức** | HTTPS API (port 443) |
+| **Auth** | OAuth2 (token, hết hạn định kỳ) |
+| **Mã hóa in-transit** | ✅ HTTPS |
+| **Mã hóa at-rest** | ✅ Google mã hóa (nhưng Google đọc được) |
+| **Muốn che Google?** | Dùng `rclone crypt` |
+| **Rate limit** | 750GB/ngày (free) — vượt sẽ bị chặn 24h |
+| **Token hết hạn** | rclone tự refresh — nhưng đôi khi phải re-auth |
+
+---
+
+## PHẦN 3: SO SÁNH NHANH
+
+| | MEGA | Google Drive |
+|---|---|---|
+| **Dung lượng free** | 20GB | 15GB |
+| **Giao thức** | HTTPS API | HTTPS API |
+| **Auth** | Email + pass | OAuth2 |
+| **Mã hóa at-rest** | ✅ MEGA tự mã hóa (E2E) | ⚠️ Google mã hóa nhưng đọc được |
+| **Cần `rclone crypt`?** | Không bắt buộc | Nên dùng nếu mật |
+| **Rate limit** | Có (transfer quota) | 750GB/ngày |
+| **Dễ setup** | Dễ hơn | Phức tạp hơn (OAuth) |
+| **Remote name** | `mega:` | `drive:` |
+
+---
+
+## PHẦN 4: KÉO VỀ — CẦN INTERNET KHÔNG?
+
+### Câu trả lời: **CÓ — bắt buộc.**
+
+| Hành động | Cần Internet? |
+|---|---|
+| Đẩy lên cloud | ✅ Có |
+| Kéo từ cloud về | ✅ Có |
+| Đọc file đã cache | ❌ Không (nếu mount + cache) |
+| Sync local ↔ cloud | ✅ Có |
+
+**Lý do:** Cloud nằm trên Internet. Muốn đẩy/kéo → phải ra Internet.
+
+### Sơ đồ kéo về
+
+```
+[MEGA/Drive Server]
+        │
+        │ HTTPS 443
+        ▼
+[Internet]
+        │
+        ▼
+[Router/Firewall nhà bạn]
+        │
+        ▼
+[Máy Windows 11 của bạn]
+        │
+        │ rclone copy mega:/backup/ D:\download\
+        ▼
+[File trên ổ D]
+```
+
+**Lệnh kéo:**
+```powershell
+.\rclone.exe copy mega:/backup/ "D:\download\" --progress
+```
+
+**Lưu ý:**
+- Máy kéo **phải có Internet** (ra được mega.nz / googleapis.com)
+- **Không cần mở port** (outbound 443 là đủ)
+- Có thể kéo từ **bất kỳ máy nào** có Internet + config rclone
+
+---
+
+## PHẦN 5: QUY TRÌNH ĐẦY ĐỦ — TỪ ĐẦU ĐẾN CUỐI
+
+### Kịch bản: Đẩy file từ Windows 11 → MEGA → kéo về máy khác
+
+```
+BƯỚC 1: Đăng ký MEGA
+  └─ https://mega.nz/register
+  └─ Lưu email + password
+
+BƯỚC 2: Cấu hình rclone trên máy đẩy
+  └─ rclone config create mega mega user=... pass=...
+  └─ rclone lsd mega:   (test)
+
+BƯỚC 3: Đẩy file lên
+  └─ rclone copy "D:\data\bigfile.7z" mega:/backup/ --progress
+
+BƯỚC 4: (Tùy chọn) Mã hóa end-to-end
+  └─ rclone config create megacrypt crypt remote=mega:/backup ...
+  └─ rclone copy file megacrypt:
+
+BƯỚC 5: Trên máy kéo (máy khác có Internet)
+  └─ Cấu hình rclone với cùng tài khoản MEGA
+  └─ rclone copy mega:/backup/bigfile.7z "D:\download\" --progress
+
+BƯỚC 6: Kiểm tra
+  └─ rclone check mega:/backup/ "D:\download\" --checksum
+```
+
+---
+
+## PHẦN 6: CẤU HÌNH MẪU `rclone.conf`
+
+Sau khi setup, file `rclone.conf` (ở `%APPDATA%\rclone\rclone.conf` trên Windows) sẽ có dạng:
+
+```ini
+[mega]
+type = mega
+user = your-email@gmail.com
+pass = xxxxxxxxxxxxxxxxxxxxxxxx
+
+[gdrive]
+type = drive
+scope = drive
+token = {"access_token":"...","refresh_token":"...","expiry":"..."}
+team_drive =
+
+[megacrypt]
+type = crypt
+remote = mega:/backup/encrypted
+filename_encryption = standard
+directory_name_encryption = true
+password = xxxxxxxxxxxxxxxxxxxxxxxx
+password2 = yyyyyyyyyyyyyyyyyyyyyyyy
+```
+
+**Xem config:**
+```powershell
+.\rclone.exe config show mega
+.\rclone.exe config file
+```
+
+---
+
+## PHẦN 7: LỆNH HAY DÙNG
+
+```powershell
+# Xem danh sách remote
+.\rclone.exe listremotes
+
+# Xem cấu hình 1 remote
+.\rclone.exe config show mega
+
+# Liệt kê file
+.\rclone.exe ls mega:/backup/
+.\rclone.exe lsd mega:/
+
+# Đẩy
+.\rclone.exe copy "D:\data\bigfile.7z" mega:/backup/ --progress
+
+# Kéo
+.\rclone.exe copy mega:/backup/bigfile.7z "D:\download\" --progress
+
+# Đồng bộ (1 chiều, xóa file thừa ở đích)
+.\rclone.exe sync "D:\data\" mega:/backup/ --progress
+
+# Kiểm tra
+.\rclone.exe check "D:\data\" mega:/backup/ --checksum
+
+# Xóa
+.\rclone.exe delete mega:/backup/bigfile.7z
+
+# Dung lượng
+.\rclone.exe about mega:
+```
+
+---
+
+## PHẦN 8: MÃ HÓA END-TO-END (nếu muốn che cả MEGA/Google)
+
+**MEGA** đã mã hóa E2E sẵn → không cần.
+**Google Drive** thì Google đọc được → nên dùng `crypt`.
+
+```powershell
+# Tạo crypt bọc lên gdrive
+.\rclone.exe config create gdcrypt crypt `
+  remote=gdrive:/backup/encrypted `
+  filename_encryption=standard `
+  directory_name_encryption=true `
+  password=$(.\rclone.exe obscure "MatKhauCrypt1") `
+  password2=$(.\rclone.exe obscure "SaltCrypt2")
+
+# Đẩy qua crypt
+.\rclone.exe copy "D:\data\bigfile.7z" gdcrypt: --progress
+
+# Kéo qua crypt
+.\rclone.exe copy gdcrypt:bigfile.7z "D:\download\" --progress
+```
+
+---
+
+## PHẦN 9: LỖI THƯỜNG GẶP
+
+| Lỗi | Nguyên nhân | Cách sửa |
+|---|---|---|
+| `couldn't login: 403` | Sai pass MEGA | Kiểm tra email/pass |
+| `quota exceeded` | Hết dung lượng / transfer quota | Chờ hoặc nâng gói |
+| `oauth token expired` | Token Google hết hạn | `rclone config reconnect gdrive:` |
+| `rate limit exceeded` | Vượt 750GB/ngày (Drive) | Chờ 24h |
+| `connection refused` | Không có Internet / firewall chặn | Kiểm tra mạng |
+| `failed to open source` | Sai đường dẫn | Kiểm tra path |
+| `directory not found` | Thư mục đích chưa có | rclone tự tạo khi copy |
+
+---
+
+## PHẦN 10: TÓM TẮT — 3 LỆNH CHÍNH CHO MEGA
+
+```powershell
+# 1. Cấu hình
+.\rclone.exe config create mega mega user=your-email@gmail.com pass=$(.\rclone.exe obscure "MatKhau")
+
+# 2. Đẩy lên
+.\rclone.exe copy "D:\data\bigfile.7z" mega:/backup/ --progress
+
+# 3. Kéo về
+.\rclone.exe copy mega:/backup/bigfile.7z "D:\download\" --progress
+```
+
+**Cho Google Drive:**
+```powershell
+# 1. Cấu hình (cần browser OAuth)
+.\rclone.exe config
+# → chọn drive, làm theo hướng dẫn, browser mở ra
+
+# 2. Đẩy
+.\rclone.exe copy "D:\data\bigfile.7z" gdrive:/backup/ --progress
+
+# 3. Kéo
+.\rclone.exe copy gdrive:/backup/bigfile.7z "D:\download\" --progress
+```
+
+---
+
+## PHẦN 11: TRẢ LỜI CÂU HỎI CỦA BẠN
+
+| Câu hỏi | Trả lời |
+|---|---|
+| **MEGA hỗ trợ giao thức gì?** | HTTPS API (port 443) — không phải SFTP |
+| **Cần setup gì?** | Đăng ký MEGA → `rclone config` → chạy |
+| **Đẩy lên sao?** | `rclone copy file mega:/backup/` |
+| **Kéo về sao?** | `rclone copy mega:/backup/file D:\download\` |
+| **Kéo về cần Internet không?** | ✅ Có — bắt buộc (cloud ở Internet) |
+| **Có cần mở port không?** | ❌ Không — chỉ cần outbound 443 |
+| **Google Drive khác gì?** | Dùng OAuth2, phức tạp hơn, Google đọc được file |
+| **MEGA có mã hóa không?** | ✅ Có — E2E sẵn, không cần crypt thêm |
+| **Google Drive có mã hóa không?** | ⚠️ In-transit + at-rest, nhưng Google đọc được → dùng crypt nếu mật |
+
+---
+
+## PHẦN 12: LƯU Ý CUỐI
+
+- **MEGA free** có **transfer quota** — đẩy quá nhiều sẽ bị chặn tạm.
+- **Google Drive free** 15GB — dùng chung Gmail/Photos.
+- **OAuth token** Google hết hạn định kỳ — cần re-auth.
+- **Mã hóa MEGA** là E2E thật — ngay cả MEGA cũng không đọc được.
+- **Mã hóa Google** — Google có key, đọc được → dùng `crypt` nếu cần mật.
+- **Trong lab của bạn**: OK. **Ngoài đời**: tuân thủ pháp luật.
+
+Bạn muốn tôi viết thêm phần **tự động hóa** (script PowerShell đẩy định kỳ) hay **redirector chain** (VPS → MEGA) không?
