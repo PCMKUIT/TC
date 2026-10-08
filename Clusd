@@ -1,0 +1,362 @@
+# Rclone + Proxifier + SOCKS5 → lỗi `no such host`
+
+Bạn đúng — **99% là vấn đề DNS**, không phải rclone hỏng. Đây là vấn đề **kinh điển** khi đi qua SOCKS proxy. Tôi phân tích rồi đưa cách fix.
+
+---
+
+## PHẦN 1: TẠI SAO LỖI `no such host`?
+
+### 1.1 Cơ chế DNS bình thường
+
+```
+Máy Windows → hỏi DNS (thường 8.8.8.8 hoặc DNS nhà mạng)
+           → nhận IP
+           → kết nối thẳng IP
+```
+
+### 1.2 Khi đi qua Proxifier → SOCKS5
+
+```
+Máy Windows → Proxifier bắt traffic
+           → Proxifier gửi qua SOCKS5
+           → SOCKS5 server kết nối đích
+```
+
+**Vấn đề:** Proxifier có **2 chế độ DNS**:
+
+| Chế độ | Cách làm | Kết quả |
+|---|---|---|
+| **Local DNS** (mặc định) | Máy Windows tự resolve DNS → gửi IP qua SOCKS | ❌ Nếu DNS local không hoạt động → `no such host` |
+| **Remote DNS** | Gửi **hostname** qua SOCKS → SOCKS server resolve | ✅ DNS do SOCKS server làm |
+
+**Rclone** dùng Go's `net` package → **tự resolve DNS cục bộ** trước khi gửi request. Nếu DNS cục bộ hỏng (do NAT, do DNS không route qua proxy), rclone báo `no such host`.
+
+---
+
+## PHẦN 2: TẠI SAO DNS CỦA BẠN HỎNG?
+
+Máy ảo Windows dùng **NAT network**:
+
+```
+[Máy ảo Windows - NAT]
+        │
+        │ (1) DNS query → 10.0.2.3 (DNS ảo của VMware/VirtualBox)
+        ▼
+[Host machine]
+        │
+        │ (2) Host resolve DNS → nhưng host cũng đi qua Proxifier?
+        ▼
+[Proxifier]
+        │
+        │ (3) SOCKS5 → nhưng SOCKS không phải DNS proxy
+        ▼
+[Internet]
+```
+
+**Vấn đề:**
+- NAT DNS (10.0.2.3) chỉ resolve được nếu **host có DNS hoạt động**
+- Proxifier **không phải DNS proxy** — nó chỉ proxy TCP
+- Nếu host không có DNS (hoặc DNS bị chặn), máy ảo không resolve được → `no such host`
+
+**Triệu chứng điển hình:**
+- `rclone lsd mega:` ✅ chạy được (vì đã cache IP?)
+- `rclone copy` ❌ `no such host` (vì cần resolve domain mới)
+- `ping google.com` ❌ nhưng `ping 8.8.8.8` ✅ → chắc chắn DNS
+
+---
+
+## PHẦN 3: RCLONE CÓ TÍNH ĐẾN PROXY KHÔNG?
+
+### 3.1 Rclone hỗ trợ proxy **native** (không cần Proxifier)
+
+| Biến môi trường | Tác dụng |
+|---|---|
+| `HTTP_PROXY` | Proxy cho HTTP |
+| `HTTPS_PROXY` | Proxy cho HTTPS |
+| `ALL_PROXY` | Proxy cho tất cả |
+| `NO_PROXY` | Loại trừ domain |
+
+**Rclone đọc các biến này** — không cần Proxifier.
+
+**Hỗ trợ proxy scheme:**
+```
+http://user:pass@host:port
+https://user:pass@host:port
+socks5://user:pass@host:port
+socks5h://user:pass@host:port   ← QUAN TRỌNG
+```
+
+**Sự khác biệt `socks5` vs `socks5h`:**
+
+| Scheme | DNS resolve ở đâu |
+|---|---|
+| `socks5://` | **Local** (máy bạn) → dễ lỗi DNS |
+| `socks5h://` | **Remote** (SOCKS server) → DNS do server làm ✅ |
+
+→ **Đây là chìa khóa.** Dùng `socks5h://` để DNS đi qua SOCKS.
+
+### 3.2 Rclone có flag riêng cho DNS?
+
+```bash
+--dns-resolver          # resolver tùy chỉnh
+--dns-cache-time        # cache DNS
+```
+
+Nhưng **không có flag "force remote DNS"** — phải dùng `socks5h://`.
+
+---
+
+## PHẦN 4: CÁCH FIX — TỪNG BƯỚC
+
+### Cách 1: Bỏ Proxifier, dùng proxy native của rclone (KHUYẾN NGHỊ)
+
+**Bước 1:** Tắt Proxifier (hoặc để nó không bắt rclone).
+
+**Bước 2:** Set biến môi trường với `socks5h://`:
+
+```powershell
+# PowerShell
+$env:HTTPS_PROXY="socks5h://user:pass@IP_SOCKS:PORT"
+$env:HTTP_PROXY="socks5h://user:pass@IP_SOCKS:PORT"
+
+# Chạy rclone
+.\rclone.exe copy "D:\data\bigfile.7z" mega:/backup/ --progress
+```
+
+**Hoặc CMD:**
+```cmd
+set HTTPS_PROXY=socks5h://user:pass@IP_SOCKS:PORT
+set HTTP_PROXY=socks5h://user:pass@IP_SOCKS:PORT
+rclone.exe copy "D:\data\bigfile.7z" mega:/backup/ --progress
+```
+
+**Hoặc set vĩnh viễn:**
+```powershell
+[System.Environment]::SetEnvironmentVariable("HTTPS_PROXY","socks5h://user:pass@IP:PORT","User")
+[System.Environment]::SetEnvironmentVariable("HTTP_PROXY","socks5h://user:pass@IP:PORT","User")
+```
+
+→ **Đây là cách sạch nhất.** Rclone tự đi qua SOCKS, DNS do SOCKS server resolve.
+
+---
+
+### Cách 2: Giữ Proxifier nhưng bật Remote DNS
+
+**Trong Proxifier:**
+
+1. **Profile** → **Name Resolution**
+2. Chọn **"Resolve hostnames through proxy"** (thay vì "Detect DNS settings automatically")
+3. **Apply** → **OK**
+
+**Trong Proxifier → Proxies:**
+- Chọn SOCKS5 proxy
+- Đảm bảo **"Resolve DNS through proxy"** được bật
+
+→ Proxifier sẽ gửi **hostname** qua SOCKS thay vì IP.
+
+---
+
+### Cách 3: Sửa DNS của máy ảo Windows
+
+**Nếu vẫn muốn Proxifier + local DNS:**
+
+**Bước 1:** Đặt DNS máy ảo thành DNS công cộng:
+```
+Control Panel → Network → Adapter → IPv4 → DNS:
+  8.8.8.8
+  1.1.1.1
+```
+
+**Bước 2:** Nhưng nếu host không route DNS → vẫn hỏng. Phải đảm bảo **host có DNS hoạt động** và **NAT cho phép DNS ra**.
+
+**Bước 3:** Test:
+```powershell
+nslookup mega.nz 8.8.8.8
+Resolve-DnsName mega.nz
+```
+
+Nếu `nslookup` fail → DNS không ra được → phải dùng cách 1 hoặc 2.
+
+---
+
+### Cách 4: Dùng `--dns-resolver` của rclone
+
+Nếu bạn có DNS server riêng (qua SOCKS):
+
+```powershell
+.\rclone.exe copy file mega:/backup/ `
+  --dns-resolver 8.8.8.8:53 `
+  --progress
+```
+
+Nhưng **vẫn cần route DNS ra** — nếu không thì vô ích.
+
+---
+
+## PHẦN 5: SO SÁNH CÁC CÁCH
+
+| Cách | DNS resolve ở đâu | Ưu | Nhược |
+|---|---|---|---|
+| **Proxifier local DNS** | Máy Windows | Đơn giản | ❌ Dễ lỗi `no such host` |
+| **Proxifier remote DNS** | SOCKS server | ✅ Tốt | Cần cấu hình đúng |
+| **Rclone `socks5h://`** | SOCKS server | ✅ Sạch nhất | Phải tắt Proxifier cho rclone |
+| **Rclone `socks5://`** | Máy Windows | ❌ Vẫn lỗi | Không dùng |
+| **DNS công cộng** | 8.8.8.8 | Có thể work | Cần route DNS ra |
+
+**Khuyến nghị:** **Cách 1 (rclone `socks5h://`)** — sạch, không phụ thuộc Proxifier.
+
+---
+
+## PHẦN 6: KIỂM TRA & DEBUG
+
+### 6.1 Test DNS trên máy ảo
+
+```powershell
+# Test resolve
+nslookup mega.nz
+Resolve-DnsName mega.nz
+ping mega.nz
+
+# Test không DNS (chỉ IP)
+ping 8.8.8.8
+```
+
+| Kết quả | Kết luận |
+|---|---|
+| `ping 8.8.8.8` ✅, `ping mega.nz` ❌ | DNS hỏng |
+| Cả hai ❌ | Không có Internet |
+| Cả hai ✅ | DNS OK, lỗi chỗ khác |
+
+### 6.2 Test rclone với proxy
+
+```powershell
+# Bật verbose để xem
+.\rclone.exe copy file mega:/backup/ -vv --progress
+```
+
+Xem log:
+- `no such host` → DNS
+- `connection refused` → proxy sai
+- `timeout` → proxy không route được
+- `TLS handshake` → proxy chặn
+
+### 6.3 Test SOCKS proxy thủ công
+
+```powershell
+# Dùng curl qua SOCKS5
+curl.exe -x socks5h://IP:PORT https://mega.nz
+curl.exe -x socks5h://IP:PORT https://www.google.com
+
+# So sánh socks5 vs socks5h
+curl.exe -x socks5://IP:PORT https://mega.nz    # local DNS
+curl.exe -x socks5h://IP:PORT https://mega.nz   # remote DNS
+```
+
+Nếu `socks5h` work mà `socks5` không → **chắc chắn DNS**.
+
+---
+
+## PHẦN 7: CẤU HÌNH MẪU HOÀN CHỈNH
+
+### 7.1 PowerShell script
+
+```powershell
+# Set proxy với socks5h (remote DNS)
+$env:HTTPS_PROXY = "socks5h://user:pass@192.168.1.100:1080"
+$env:HTTP_PROXY  = "socks5h://user:pass@192.168.1.100:1080"
+$env:NO_PROXY    = "localhost,127.0.0.1"
+
+# Test
+.\rclone.exe lsd mega:
+
+# Đẩy file
+.\rclone.exe copy "D:\data\bigfile.7z" mega:/backup/ `
+  --progress `
+  --transfers 4 `
+  --checkers 8 `
+  --retries 5 `
+  -vv
+```
+
+### 7.2 Nếu SOCKS không cần auth
+
+```powershell
+$env:HTTPS_PROXY = "socks5h://192.168.1.100:1080"
+$env:HTTP_PROXY  = "socks5h://192.168.1.100:1080"
+```
+
+### 7.3 Nếu dùng HTTP proxy thay SOCKS
+
+```powershell
+$env:HTTPS_PROXY = "http://user:pass@proxy:8080"
+$env:HTTP_PROXY  = "http://user:pass@proxy:8080"
+```
+
+HTTP proxy **tự động remote DNS** — không có vấn đề `socks5` vs `socks5h`.
+
+---
+
+## PHẦN 8: TẠI SAO `rclone lsd` THÀNH CÔNG MÀ `copy` LỖI?
+
+| Lệnh | Cần gì | Tại sao khác |
+|---|---|---|
+| `rclone lsd mega:` | Kết nối API, liệt kê | Có thể dùng **IP đã cache** |
+| `rclone copy` | Kết nối API + upload | Cần **resolve domain mới** (upload server khác) |
+
+**MEGA dùng nhiều domain:**
+- `mega.nz` — API chính
+- `gfs*.mega.co.nz` — upload server
+- `*.mega.io` — CDN
+
+→ `lsd` chỉ cần `mega.nz` (đã cache), `copy` cần resolve `gfs*.mega.co.nz` → **DNS hỏng → lỗi**.
+
+---
+
+## PHẦN 9: TRẢ LỜI CÂU HỎI CỦA BẠN
+
+| Câu hỏi | Trả lời |
+|---|---|
+| **Rclone có tính đến Proxifier qua SOCKS chưa?** | ✅ Có — rclone hỗ trợ proxy native qua env vars |
+| **Có fix chưa?** | ✅ Đã fix — dùng `socks5h://` thay vì `socks5://` |
+| **Vấn đề chính là gì?** | DNS resolve ở local thay vì remote |
+| **Tại sao `lsd` OK mà `copy` lỗi?** | `lsd` dùng domain đã cache, `copy` cần resolve domain mới |
+| **Cách fix sạch nhất?** | Bỏ Proxifier → set `HTTPS_PROXY=socks5h://...` |
+| **Cách fix giữ Proxifier?** | Bật "Resolve hostnames through proxy" trong Proxifier |
+| **Có cần flag rclone không?** | Không — chỉ cần env var đúng scheme |
+
+---
+
+## PHẦN 10: TÓM TẮT — 3 BƯỚC FIX
+
+```powershell
+# BƯỚC 1: Tắt Proxifier cho rclone (hoặc tắt hẳn)
+
+# BƯỚC 2: Set proxy với socks5h (KHÔNG phải socks5)
+$env:HTTPS_PROXY = "socks5h://user:pass@IP_SOCKS:PORT"
+$env:HTTP_PROXY  = "socks5h://user:pass@IP_SOCKS:PORT"
+
+# BƯỚC 3: Chạy rclone
+.\rclone.exe copy "D:\data\bigfile.7z" mega:/backup/ --progress -vv
+```
+
+**Nếu vẫn lỗi:**
+1. `curl.exe -x socks5h://IP:PORT https://mega.nz` → test proxy
+2. `nslookup mega.nz` → test DNS
+3. `-vv` → xem log chi tiết
+
+**Nguyên tắc vàng:**
+> **`socks5://` = DNS local (dễ lỗi)**
+> **`socks5h://` = DNS remote (nên dùng)**
+> **Chữ `h` = hostname resolve ở proxy.**
+
+---
+
+## PHẦN 11: LƯU Ý THÊM
+
+- **Proxifier + rclone** thường **xung đột** — Proxifier bắt traffic, rclone cũng muốn tự proxy → chọn 1 trong 2.
+- **NAT network** của VMware/VirtualBox có DNS ảo (10.0.2.3) — chỉ work nếu host có DNS.
+- **MEGA** dùng nhiều subdomain → DNS phải resolve được **wildcard**.
+- **Nếu SOCKS server không hỗ trợ remote DNS** → phải dùng HTTP proxy thay thế.
+- **Kiểm tra SOCKS server** có bật `socks5h` không — một số server chỉ hỗ trợ `socks5`.
+
+Bạn muốn tôi viết script PowerShell **tự động set proxy + retry** khi lỗi DNS không?
