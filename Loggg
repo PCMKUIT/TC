@@ -29,3 +29,10 @@ Protection History (Gốc)	C:\ProgramData\Microsoft\Windows Defender\Scans\Histo
 💡 Lưu ý quan trọng về quyền hệ thống:
 • Các file có quyền thay đổi là SYSTEM hoặc TrustedInstaller nghĩa là ngay cả tài khoản Administrator thông thường cũng không thể tự ý sửa đổi hoặc xóa trực tiếp bằng cách nhấn Delete. Muốn can thiệp, bạn buộc phải sử dụng các công cụ chiếm quyền (Take Ownership), chạy script dưới quyền SYSTEM, hoặc khởi động vào môi trường cứu hộ (Windows PE/Safe Mode).
 Bạn có cần tôi viết một đoạn mã PowerShell ngắn để tự động kiểm tra và gom các file log quan trọng từ danh sách này vào một thư mục lưu trữ riêng không?
+
+Get-Content (Get-PSReadLineOption).HistorySavePath
+C:\Users\<Tên_User>\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt
+Remove-Item (Get-PSReadLineOption).HistorySavePath -Force
+Set-PSReadLineOption -HistorySaveStyle SaveNothing
+Set-PSReadLineOption -HistorySaveStyle SaveAtExit
+
