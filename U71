@@ -5,3 +5,10 @@ grep -rnw 'coky/' -e 'utf-8'
 grep -rl 'utf-8' coky/
 find coky/ -type f -exec file -i {} + | grep 'charset=utf-8' | cut -d: -f1
 find coky/ -type f | xargs file -i
+# Tạo file có chữ tiếng Việt trên Windows
+echo "tấn công" > test_win.txt
+Format-Hex .\test_win.txt
+echo "tấn công" | Out-File -FilePath .\test_win_utf8.txt -Encoding utf8
+chcp 65001
+echo tấn công > test_cmd_utf8.txt
+certutil -dump test_cmd_utf8.txt
