@@ -1,0 +1,7 @@
+Get-ChildItem -Path ".\coky" -Recurse -File | Where-Object { (Get-Content $_.FullName -Encoding utf8 -ErrorAction SilentlyContinue) -ne $null }
+Get-ChildItem -Path ".\coky" -Recurse | Select-String -Pattern "utf-8"
+find coky/ -type f -exec file -i {} + | grep 'charset=utf-8'
+grep -rnw 'coky/' -e 'utf-8'
+grep -rl 'utf-8' coky/
+find coky/ -type f -exec file -i {} + | grep 'charset=utf-8' | cut -d: -f1
+find coky/ -type f | xargs file -i
