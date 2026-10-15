@@ -1,0 +1,31 @@
+Dưới đây là bảng tổng hợp toàn bộ các loại log hệ thống, log bên thứ ba và các dấu vết pháp y (forensics) trên Windows đã đề cập, kèm theo đường dẫn và phân quyền truy cập tối thiểu:
+
+Bảng tổng hợp các loại Log trên Windows (Ngoại trừ Windows Event Log)
+
+
+Tên loại Log	Đường dẫn (Path)	Quyền tối thiểu để Đọc / Truy cập	Quyền tối thiểu để Thay đổi / Xóa
+CBS (Component-Based Servicing)	C:\Windows\Logs\CBS\CBS.log	Administrator (hoặc User thường đọc trực tiếp)	TrustedInstaller / SYSTEM
+DISM (Deployment Image)	C:\Windows\Logs\DISM\dism.log	Administrator	TrustedInstaller / SYSTEM
+Windows Update (Hiện đại)	C:\Users\<Tên_User>\Desktop\WindowsUpdate.log (Xuất qua PowerShell)	User sở hữu Desktop đó	User sở hữu Desktop đó
+Windows Update (Bản cũ)	C:\Windows\WindowsUpdate.log	Administrator	TrustedInstaller / SYSTEM
+Windows Upgrade (Panther)	C:\Windows\panther\setupact.log
+C:\$Windows.~BT\Sources\Panther\setupact.log	Administrator	TrustedInstaller / SYSTEM
+SetupAPI (Cài phần cứng/USB)	C:\Windows\inf\setupapi.dev.log
+C:\Windows\inf\setupapi.app.log	Administrator	TrustedInstaller / SYSTEM
+Windows Firewall (Tường lửa)	C:\Windows\System32\LogFiles\Firewall\pfirewall.log	Administrator	SYSTEM
+Netlogon (Dịch vụ mạng)	C:\Windows\Debug\netlogon.log	Administrator	Administrator
+IIS Logs (Dịch vụ Web)	C:\inetpub\logs\LogFiles\	Administrator / IIS_IUSRS	Administrator / SYSTEM
+Prefetch (Lịch sử ứng dụng)	C:\Windows\Prefetch\	Administrator	SYSTEM / TrustedInstaller
+Amcache (Dấu vết file .EXE)	C:\Windows\appcompat\Programs\Amcache.hve	Administrator (Cần tool đọc Registry)	SYSTEM (File luôn bị khóa khi Win chạy)
+Jump Lists (Lịch sử nhảy nhanh)	C:\Users\<Tên_User>\AppData\Roaming\Microsoft\Windows\Recent\AutomaticDestinations\	User sở hữu tài khoản	User sở hữu tài khoản
+Memory Dump (Sập nguồn FULL)	C:\Windows\MEMORY.DMP	Administrator	Administrator
+Minidump (Sập nguồn nhỏ)	C:\Windows\Minidump\	Administrator	Administrator
+User Mode Crash Dumps	C:\Users\<Tên_User>\AppData\Local\CrashDumps\	User sở hữu tài khoản	User sở hữu tài khoản
+MSI Installer (Cài app)	C:\Users\<Tên_User>\AppData\Local\Temp\MSI*.log	User sở hữu tài khoản	User sở hữu tài khoản
+Log ứng dụng bên thứ 3	C:\ProgramData\<Tên_App>\Logs\	Thường là User thường hoặc Admin	Qùy thuộc cấu hình App (Thường là Admin)
+Windows Defender (MPLog)	C:\ProgramData\Microsoft\Windows Defender\Support\	Administrator	SYSTEM
+Protection History (Gốc)	C:\ProgramData\Microsoft\Windows Defender\Scans\History\Service\	Administrator (Phải bấm Continue xác nhận)	SYSTEM (Muốn xóa tay phải tắt Real-time Protection trước)
+
+💡 Lưu ý quan trọng về quyền hệ thống:
+• Các file có quyền thay đổi là SYSTEM hoặc TrustedInstaller nghĩa là ngay cả tài khoản Administrator thông thường cũng không thể tự ý sửa đổi hoặc xóa trực tiếp bằng cách nhấn Delete. Muốn can thiệp, bạn buộc phải sử dụng các công cụ chiếm quyền (Take Ownership), chạy script dưới quyền SYSTEM, hoặc khởi động vào môi trường cứu hộ (Windows PE/Safe Mode).
+Bạn có cần tôi viết một đoạn mã PowerShell ngắn để tự động kiểm tra và gom các file log quan trọng từ danh sách này vào một thư mục lưu trữ riêng không?
