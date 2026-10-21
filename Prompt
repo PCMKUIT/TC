@@ -1,0 +1,42 @@
+Role: Senior Malware Developer & Cobalt Strike Expert
+
+Context: 
+I have a custom Cobalt Strike Aggressor Script (CNA) that utilizes a Beacon Object File (BOF) loader (`loader.cna` and `bof.o`) to execute a large shellcode payload (approx. 11MB, converted from an EXE via Donut/sRDI) inline within the current Beacon's memory space (avoiding fork-and-run / process spawning). 
+
+However, I am facing two major constraints:
+1. Data Transfer Limit: The `beacon_inline_execute` and `bof_pack` mechanism restricts the payload size to ~1MB per task, preventing the direct transmission of the 11MB shellcode from the Teamserver.
+2. Output Redirection: The shellcode prints its output to Standard Output (Stdout). Since it executes inline via a memory pointer inside the Beacon process without its own console session, the execution output is lost, and `BeaconOutput` returns nothing.
+
+Objective:
+Help me write the implementation plan and the corresponding source code for both the CNA script and the C-based BOF (`bof.c`) using an optimized "Drop-to-Disk + Named Pipe Redirection" architecture to bypass the 1MB transfer limit and successfully capture the inline execution output.
+
+Architecture & Implementation Requirements:
+
+1. Aggressor Script (CNA) Workflow:
+- Read the 11MB encrypted/raw shellcode file from the local operator's machine.
+- Instead of using `bof_pack` with `beacon_inline_execute`, use Cobalt Strike's secure file upload capabilities (or a chunked upload mechanism) to drop the shellcode file onto a stealthy target directory (e.g., `C:\Windows\Tasks\wut.dat`).
+- Call `beacon_inline_execute` to execute `bof.o`, passing the local file path (`C:\Windows\Tasks\wut.dat`) as an argument.
+- Implement post-execution cleanup in the CNA to task the deletion of the dropped file once the BOF finishes.
+
+2. Beacon Object File (bof.c) Workflow:
+- Dynamic API Resolving: Use Cobalt Strike's Internal Beacon APIs (`KERNEL32$...`, `NTDLL$...`) to dynamically resolve necessary Win32 APIs to maintain opsec.
+- Stdout Redirection via Named Pipe: 
+    * Prior to executing the shellcode, create an anonymous or named pipe using `CreateNamedPipeA`.
+    * Save the original standard output handle via `GetStdHandle(STD_OUTPUT_HANDLE)`.
+    * Use `SetStdHandle(STD_OUTPUT_HANDLE, hWritePipe)` to redirect the current process's stdout into the write-end of the pipe.
+- Memory Allocation & File Loading:
+    * Open the dropped 11MB file using `CreateFileA` and `ReadFile`.
+    * Allocate a memory region matching the file size using `VirtualAlloc` with `PAGE_READWRITE`.
+    * Read the shellcode directly into this allocated buffer.
+    * Change memory permissions to `PAGE_EXECUTE_READ` using `VirtualProtect`.
+- Execution:
+    * Execute the shellcode inline (either by casting the buffer pointer to a function pointer and calling it, or by spinning up a short-lived thread using `CreateThread` and waiting for it via `WaitForSingleObject`).
+- Output Capture & Cleanup:
+    * Flush and restore the original stdout handle using `SetStdHandle`.
+    * Use `ReadFile` to drain the read-end of the pipe into a dynamic buffer containing the shellcode's printed output.
+    * Use `BeaconFormatPrintf` or `BeaconOutput` to securely send the captured output back to the Cobalt Strike Teamserver.
+    * Zero-out (memcpy zeros) and free the allocated shellcode memory buffer (`VirtualFree`) to minimize memory forensic artifacts.
+
+Please generate:
+1. The `loader.cna` script implementing the file drop and BOF execution logic.
+2. The `bof.c` source code utilizing Beacon Internal APIs, handling the Named Pipe stdout hijacking, file reading, memory execution, and returning the output data buffer to the C2. Include clean, readable comments for each phase.
