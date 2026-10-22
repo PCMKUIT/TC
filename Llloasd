@@ -1,0 +1,10 @@
+SystemSettings.exe (sideload trigger)
+  └─ DllMain → CreateThread
+       └─ BeaconThread:
+            1. CoCreateInstance(CLSID hợp lệ) → Windows spawn dllhost.exe /Processid:{GUID}
+               (parent = svchost, command line chuẩn, token chuẩn)
+            2. Tìm PID dllhost vừa spawn (snapshot trước/sau)
+            3. Module Stomping: map version.dll (hoặc amsi.dll) vào dllhost,
+               overwrite .text bằng beacon shellcode
+            4. Beacon chạy trong dllhost, kết nối C2
+            5. SystemSettings.exe chết → không ảnh hưởng
