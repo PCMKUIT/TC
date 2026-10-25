@@ -1,0 +1,42 @@
+Đối với các công cụ như **Mimikatz**, việc sử dụng **Donut** để chuyển đổi file thực thi (`.exe`) thành shellcode độc lập và nạp qua custom loader là một kỹ thuật kinh điển trong Red Teaming. Tuy nhiên, đúng như bạn đã nhận ra, nó vướng phải một trở ngại lớn về mặt kiến trúc: **Mimikatz nguyên bản là một công cụ dạng CLI (Command Line Interface)**, bắt buộc phải nhận các tham số dòng lệnh (ví dụ: `privilege::debug`, `sekurlsa::logonpasswords`, `exit`) mới thực hiện hành vi, chứ không tự động chạy ngầm hay thực thi ngay khi nạp vào bộ nhớ.
+
+Khi bạn dùng Donut sinh shellcode và dùng Loader nhét vào tiến trình, shellcode đó chỉ đơn thuần khởi chạy tiến trình con hoặc thực thi hàm `main()` của Mimikatz với **dòng lệnh trống (không có tham số)**. Kết quả là chương trình sẽ lập tức bật bảng điều khiển (hoặc chết ngầm) mà không đổ ra dữ liệu mã nguồn mật khẩu nào, trong khi Kaspersky (với các tính năng AMSI, ETW, Behavioural Detection và Hooking sâu vào API) sẽ dễ dàng tóm gọn hành vi khi nó cố gắng truy cập vào tiến trình `lsass.exe`.
+
+Để giải quyết bài toán này trong môi trường có sự giám sát của AV/EDR như Kaspersky, bạn có thể tham khảo các ý tưởng và hướng tiếp cận kỹ thuật sau:
+
+---
+
+### 1. Thay đổi cách truyền tham số cho Shellcode (In-Memory Command Line Patching / PPID Spoofing)
+
+Vì Donut có hỗ trợ tham số hóa khi tạo shellcode, bạn có thể truyền trực tiếp chuỗi tham số mong muốn ngay từ lúc đóng gói:
+
+* **Sử dụng tham số của Donut:** Khi chạy Donut để sinh shellcode từ file `mimikatz.exe`, bạn có thể chỉ định tham số dòng lệnh đi kèm. Ví dụ:
+```bash
+donut -i mimikatz.exe -p "privilege::debug sekurlsa::logonpasswords exit" -o payload.bin
+
+```
+
+
+Lúc này, khi loader của bạn thi hành shellcode, nó sẽ tự động cấp phát và truyền chuỗi tham số đó vào hàm `main`/`WinMain` của Mimikatz như thể bạn đang gõ lệnh ngoài màn hình đen.
+* **Tự viết Stub định hướng tham số trong Loader:** Thay vì dùng Donut, nhiều Red Teamer tự viết mộtreflective DLL/loader riêng cho phép nạp Mimikatz dưới dạng thư viện (`mimilib` hoặc gọi trực tiếp các hàm xuất khẩu của `mimikatz` thông qua API nội bộ thay vì chạy file exe qua dòng lệnh).
+
+### 2. Tránh né sự giám sát của Kaspersky nhắm vào `lsass.exe`
+
+Ngay cả khi bạn truyền tham số thành công, vấn đề cốt lõi khiến Mimikatz chết dưới tay Kaspersky không chỉ nằm ở việc "file có bị quét hay không", mà nằm ở **hành vi trích xuất thông tin (Credential Dumping)**:
+
+* **Kaspersky giám sát chặt `OpenProcess` và `MiniDumpWriteDump` / đọc bộ nhớ LSASS:** Bất kỳ tiến trình nào cố gắng mở handle có quyền `PROCESS_VM_READ` hoặc `PROCESS_QUERY_INFORMATION` tới `lsass.exe` đều bị Kaspersky phát hiện và chặn lập tức.
+* **Giải pháp lẩn tránh (Evasion Techniques):**
+* **Direct System Calls / Indirect Syscalls:** Thay vì gọi hàm `OpenProcess` thông thường của Windows (vốn đã bị Kaspersky đặt Hook), loader hoặc công cụ của bạn sẽ tự gọi trực tiếp System Call ở tầng kernel để qua mặt các User-Mode Hook của AV.
+* **Duplicate Handle:** Thay vì mở handle mới tới LSASS, kỹ thuật này tìm các handle đã mở sẵn có từ trước (ví dụ từ các tiến trình hệ thống) để tận dụng.
+* **PPL (Protected Process Light) Bypass:** Nếu môi trường bật tính năng bảo vệ LSASS, các kỹ thuật thông thường sẽ thất bại trừ khi có driver riêng hoặc khai thác lỗi kernel (Bring Your Own Vulnerable Driver - BYOVD), tuy nhiên cách này rất dễ kích hoạt cảnh báo Driver Blocklist của Windows và AV.
+
+
+
+### 3. Chuyển dịch tư duy: Không dùng `mimikatz.exe` dạng thô
+
+Vì Mimikatz bản `.exe` hoặc `.dll` gốc đã có "chữ ký hành vi" quá nổi tiếng bị các hãng bảo mật định nghĩa từ lâu, việc cố gắng bọc nó lại bằng Donut hay các loại loader thông thường rất rủi ro. Các chuyên gia thường chọn các hướng đi sạch hơn:
+
+* **Sử dụng PowerShell / C# Alternative (Memory-only execution):** Thay vì nạp file PE nặng nề, sử dụng các script hoặcAssembly mã nguồn mở được viết lại bằng C# (ví dụ các phiên bản thu gọn tích hợp trong Covenant, Sliver, hoặc các project dạng *SharpKatz*) rồi dùng kỹ thuật **Assembly Execution / Reflection** trực tiếp trong bộ nhớ quản lý của một tiến trình được phép (như `msbuild.exe` hoặc `RegAsm.exe`).
+* **Sử dụng Native API / Minidump tùy biến:** Tự viết một đoạn code nhỏ bằng C/C++ để tự dump tiến trình LSASS ra một file ẩn, mã hóa nó ngay lập tức, rồi truyền tải (exfiltrate) về máy chủ điều khiển để phân tích ngoại tuyến (Offline Cracking), thay vì cố gắng chạy toàn bộ lệnh Mimikatz trực tiếp trên máy nạn nhân dưới sự giám sát của AV.
+
+**Tóm lại:** Ý tưởng dùng Donut kết hợp Loader là khả thi về mặt kỹ thuật **nếu bạn nhúng sẵn chuỗi tham số vào lệnh tạo Donut** (`-p "..."`). Tuy nhiên, để qua mặt Kaspersky, việc vượt qua khâu "nạp file" chỉ mới giải quyết được 50% chặng đường; thử thách lớn thực sự nằm ở việc làm sao qua mặt được cơ chế kiểm soát truy cập bộ nhớ `lsass.exe` ở tầng sâu của phần mềm diệt virus.
