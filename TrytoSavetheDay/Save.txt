@@ -1,0 +1,98 @@
+Tổng quan: wp2shell là một chuỗi khai thác cho phép thực thi mã từ xa không cần xác thực trong WordPress core. Đầu tiên thông qua Route Confusion của REST API batch endpoint để vượt qua cơ chế kiểm tra tham số và phương thức, sau đó thông qua lỗi làm sạch tham số author__not_in trong WP_Query để tạo ra SQL injection, cuối cùng thông qua một loạt các tiện ích chuỗi (oEmbed cache, customize_changeset, hook parse_request) để leo thang đặc quyền lên quản trị viên và trực tiếp chiếm quyền điều khiển máy chủ.
+Lỗ hổng 1: Nhầm lẫn tuyến đường Batch API (CVE-2026-63030)
+
+Vị trí: Phương thức serve_batch_request_v1() trong class-wp-rest-server.php của WordPress core.
+
+Nguyên nhân: Khi xử lý các yêu cầu con trong batch, endpoint duy trì hai mảng: $matches (bộ xử lý khớp) và $validation (kết quả xác thực). Khi đường dẫn của một yêu cầu con không thể phân tích cú pháp (ví dụ: http://:, ///), nó sẽ được thêm vào $validation, nhưng do câu lệnh continue, nó không được thêm vào $matches.
+
+Hậu quả: Hai mảng bị lệch chỉ số. Yêu cầu con thứ N được thực thi bằng bộ xử lý của handler của yêu cầu con thứ N+1, nhưng request được gửi vẫn là của chính nó. Tức lúc này WordPress sẽ sử dụng schema của một endpoint khác để xử lý các tham số được truyền vào. Bốn tham số được truyền vào hàm respond_to_request để thực thi là $single_request, $route, $handler, $error, nhưng chỉ request và error được truyền đúng thứ tự, và các tham số bên trong sẽ được xử lý theo route và trình xử lý handler của yêu cầu con đằng sau đó.
+
+Lỗ hổng 2: SQL Injection trong WP_Query (CVE-2026-60137)
+
+Vị trí: Đoạn mã xử lý tham số truy vấn author__not_in trong class-wp-query.php của WordPress core.
+
+Nguyên nhân: Khi author__not_in là một mảng, từng phần tử sẽ được xử lý bằng absint() để chuyển đổi thành số nguyên một cách an toàn. Nhưng khi nó là một chuỗi (scalar), WordPress sẽ nối trực tiếp vào câu lệnh SQL.
+
+Hậu quả: Có thể chèn SQL Injection vào tham số author__not_in. Trong điều kiện bình thường mà không có Route Confusio trước đó, tham số author_exclude mà endpoint REST công khai nhận được yêu cầu phải là một mảng số nguyên, khiến lỗ hổng này không thể khai thác trực tiếp.
+
+Ý tưởng vượt qua: Từ "Nhầm lẫn tuyến đường" đến "SQL Injection"
+Mạch khai thác cốt lõi là "sử dụng batch để tấn công batch", thực hiện đệ quy hai lần vượt qua:
+
+Vượt qua giới hạn phương thức: Batch API mặc định không cho phép GET, nhưng việc xác thực phương thức lại được thực hiện trong quá trình xác thực tham số. Lợi dụng lỗ hổng 1 để khiến một yêu cầu con POST /wp/v2/posts được xử lý như một endpoint batch, từ đó đưa một batch lồng nhau vào phần body của nó. Các yêu cầu con bên trong batch lồng nhau này sẽ không còn bị ràng buộc bởi danh sách trắng phương thức (vì chúng được coi là body của một yêu cầu POST thông thường), và có thể sử dụng GET.
+
+Vượt qua làm sạch tham số: Trong batch lồng nhau, gửi một yêu cầu GET /wp/v2/posts/999999. Route item này sử dung trình xử lý get_item() vốn không có rule và sẽ không kiểm tra các tham số collection như author_exclude. Thông qua lỗ hổng 1, yêu cầu này được chuyển tiếp sang bộ xử lý get_items() của route collection. Tại đây, author_exclude được ánh xạ thành author__not_in, chấp nhận xử lý giá trị chuỗi độc hại được đưa vào trong.
+
+Tại đây sử dung UNION SQL injection tạo bài viết giả trong bộ nhớ đệm. Mục đích là để trả về các hàng giả có cấu trúc wp_posts (23 cột). Các bài viết giả này được WordPress nhận diện như WP_Post thật và được lưu vào bộ nhớ đệm trong suốt request. Khi WordPress xử lý nội dung này qua REST API, nó sẽ render shortcode — bao gồm [embed]
+
+Bước chuyển từ "bộ nhớ" sang "database": Thông qua oEmbed cache
+WordPress có cơ chế embed: khi gặp [embed]/?p=S[/embed], nó nhận ra đây là embed nội bộ (relative path), không gọi HTTP ra ngoài, nhưng vẫn tạo một hàng thật trong database với post_type = oembed_cache.
+Bài viết chứa embed trỏ đến một ID. WordPress tạo hàng oembed_cache thật trong wp_posts. Đây là bước đầu tiên thoát khỏi bộ nhớ đệm, ghi dữ liệu thật vào database từ một SQLi chỉ đọc. Sau đó vẫn cần dùng lại SQLi để đọc ngược ID của các hàng oembed_cache vừa được tạo, vì đây là wordpress tự tạo.
+Bước tiếp theo: oembed_cache thành customize_changeset
+UNION để tạo một bài viết giả cùng ID với hàng oembed_cache thật, nhưng gán post_type = customize_changeset và post_content chứa JSON changeset.
+Khi WordPress phát hiện sự khác biệt giữa bản trong bộ nhớ đệm và bản trong database, nó gọi wp_update_post() để đồng bộ. Trong lệnh này, post_content bị ghi đè bằng nội dung embed.
+Vấn đề: wp_update_post() ghi đè post_content, nên JSON changeset bị mất.
+Ý tưởng: Giải quyết bang Cycle detection như sau:
+Gán post_parent của changeset trỏ về chính nó (hoặc tạo vòng lặp cha-con).
+WordPress phát hiện vòng lặp và gọi wp_update_post( array( 'ID' => C, 'post_parent' => 0 ) ) — lệnh này KHÔNG ghi đè post_content.
+Nhờ vậy, JSON changeset trong bộ nhớ đệm được giữ nguyên và ghi vào database
+Kích hoạt changeset: mạo danh admin
+Changeset có post_status = future và post_date là quá khứ. WordPress thấy changeset "đáng lẽ đã được áp dụng" nên tự động áp dụng nó.
+Trong JSON changeset, POC đặt user_id: 1 (admin). Khi áp dụng, WordPress gọi wp_set_current_user(1) — tạm thời mạo danh admin
+Hook parse_request: phát lại request với quyền admin
+Sau khi mạo danh, quyền admin sẽ mất khi request kết thúc. POC cần kéo dài quyền admin trong cùng request.
+
+Gadget cuối: tạo một bài viết giả với post_status = parse, post_type = request. Khi WordPress "publish" bài viết này, nó gọi hook "{$new_status}_{$post_type}" = parse_request. Hook này phát lại toàn bộ batch request từ đầu, nhưng lúc này quyền admin vẫn còn .
+
+Trong lần phát lại, sub-request POST /wp/v2/users (tạo admin mới) được thực thi với quyền admin — thành công.
+Chi tiết các bước:
+Bước 1: UNION tạo bài viết giả trong bộ nhớ
+POC dùng payload dạng:
+
+text
+author_exclude=1) AND 1=0 UNION ALL SELECT <23 cột wp_posts> -- -
+Các cột được điền để tạo một WP_Post giả có post_content chứa shortcode [embed]/?p=S[/embed] và post_type tùy ý. WordPress nhận các row này qua get_items(), tạo WP_Post object, và cache trong bộ nhớ request.
+
+Bước 2: Render shortcode → tạo oEmbed cache thật
+Khi WordPress xử lý nội dung của bài viết giả (qua context=view), nó render shortcode [embed]. Vì URL là relative (/?p=S), WordPress không gọi HTTP ra ngoài, nhưng tạo một hàng thật trong wp_posts với post_type = oembed_cache. Đây là lần đầu tiên dữ liệu thoát khỏi bộ nhớ và vào database.
+
+Bước 3: Đọc lại ID thật của oEmbed cache
+POC dùng SQLi để query wp_posts tìm các hàng oembed_cache vừa tạo, lấy ID thật. Bước này cần thiết vì ID do MySQL sinh ra, POC không biết trước.
+
+Bước 4: "Lột xác" oEmbed cache thành customize_changeset
+POC dùng UNION để tạo một bài viết giả cùng ID với oEmbed cache thật, nhưng:
+
+post_type = customize_changeset
+
+post_content chứa JSON changeset với "user_id": 1 (admin)
+
+post_status = future, post_date là quá khứ
+
+Khi WordPress phát hiện sự khác biệt giữa bản trong bộ nhớ và bản trong database, nó gọi wp_update_post(). Trong lệnh này, post_content bị ghi đè bằng nội dung embed, nhưng post_type được lấy từ bộ nhớ đệm → hàng thật trong database bị đổi thành customize_changeset.
+
+Bước 5: Gadget "Cycle" giữ lại JSON changeset
+POC gán post_parent của changeset trỏ về chính nó (hoặc tạo vòng lặp), khiến WordPress phát hiện cycle và gọi:
+
+php
+wp_update_post( array( 'ID' => C, 'post_parent' => 0 ) );
+Lệnh này không ghi đè post_content, nên JSON changeset được giữ nguyên và ghi vào database.
+
+Bước 6: Changeset tự động áp dụng → mạo danh admin
+Vì changeset có post_status = future và post_date quá khứ, WordPress tự động áp dụng nó. Trong JSON, user_id: 1 khiến WordPress gọi wp_set_current_user(1) — tạm thời mạo danh admin.
+
+Bước 7: Hook parse_request phát lại request với quyền admin
+POC tạo thêm một bài viết giả với post_status = parse, post_type = request. Khi WordPress "publish" bài này, nó gọi hook "{$new_status}_{$post_type}" = parse_request, phát lại toàn bộ batch request từ đầu — nhưng lúc này quyền admin vẫn còn.
+
+Bước 8: Batch phát lại tạo admin mới
+Trong batch gốc, POC đã nhúng sẵn một sub-request POST /wp/v2/users tạo admin. Lần đầu, với tư cách khách, nó thất bại. Lần phát lại, với quyền admin, nó thành công → admin mới được tạo
+
+Sau khi tạo được tài khoản admin, đăng nhập bằng admin mới (login() trong file shell.py). Sau đó upload plugin webshell lên WordPress qua /wp-admin/plugin-install.php?tab=upload → /wp-admin/update.php?action=upload-plugin. Gọi webshell qua HTTP với token riêng để chạy lệnh OS (qua hàm run()). Dọn dẹp thông qua cleanup(), delete_user_with_shell().
+
+Cover track:
+Ưu điểm:
+- Xóa plugin webshell đã tạo
+- Xóa account admin đã tạo qua wp_delete_user
+Những gì có thể triển khai thêm:
+- Xóa bài viết giả do SQLi tạo
+- Xóa wp-content/debug.log nếu có (mặc định không có sẵn)
+Hạn chế:
+Vẫn còn lưu lại log trên webserver. Ví dụ: /var/log/apache2/access.log (ghi lại request các gói tin POST kèm payload)
