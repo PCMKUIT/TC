@@ -1,0 +1,40 @@
+<?php
+header('Content-Type: text/plain; charset=utf-8');
+function p($k,$v){echo str_pad($k,24).": ".(is_bool($v)?($v?'true':'false'):(is_array($v)?implode(',',$v):(string)$v))."\n";}
+
+echo "=== PHP/USER ===\n";
+p('php',PHP_VERSION); p('sapi',php_sapi_name()); p('os',PHP_OS);
+p('uid',function_exists('posix_geteuid')?posix_geteuid():'?');
+p('user',function_exists('posix_getpwuid')?(posix_getpwuid(posix_geteuid())['name']??'?'):'?');
+p('groups',function_exists('posix_getgroups')?posix_getgroups():'?');
+p('cwd',getcwd()); p('disable',ini_get('disable_functions'));
+
+echo "\n=== FFI ===\n";
+p('ffi.enable',ini_get('ffi.enable')); p('ffi.loaded',extension_loaded('ffi')?'YES':'no');
+
+echo "\n=== EXT ===\n";
+$e=get_loaded_extensions();
+foreach(['ffi','imagick','expect','pcntl','posix','curl','sockets','redis'] as $x) p($x,in_array($x,$e)?'YES':'no');
+
+echo "\n=== WRITE ===\n";
+$h=getenv('HOME')?:'';
+foreach(['/tmp','/dev/shm','/var/www/html',$h,$h.'/.ssh','/etc/cron.d','/var/spool/cron'] as $x)
+  p($x,!file_exists($x)?'no':(is_writable($x)?'WRITABLE':'ro'));
+
+echo "\n=== SVC ===\n";
+foreach(['/var/run/docker.sock','/run/docker.sock','/var/run/redis/redis.sock','/var/run/mysqld/mysqld.sock'] as $x)
+  p($x,!file_exists($x)?'no':(is_readable($x)?'READABLE':'ro'));
+
+echo "\n=== MAIL/PUTENV ===\n";
+p('putenv',function_exists('putenv')?'YES':'no');
+p('mail',function_exists('mail')?'YES':'no');
+p('sendmail',ini_get('sendmail_path'));
+
+echo "\n=== MOUNT ===\n";
+$m=@file_get_contents('/proc/mounts')?:'';
+foreach(explode("\n",$m) as $l) if(preg_match('#\s(/tmp|/dev/shm|/var/tmp)\s#',$l))
+  p(explode(' ',$l)[1],strpos($l,'noexec')!==false?'noexec':'exec');
+
+echo "\n=== FN ===\n";
+foreach(['file_put_contents','fopen','copy','rename','symlink','error_log','ini_set','chdir','scandir','glob','curl_exec','file_get_contents'] as $f)
+  p($f,function_exists($f)?'YES':'NO');
