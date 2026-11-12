@@ -1,0 +1,439 @@
+Technical Research Brief: PHP 8.4.27 "disable_functions" Bypass via Three Use-After-Free (UAF) Exploitation Approaches
+
+1. Research Context and Objective
+
+I am conducting authorized security research on my own local WordPress installation.
+
+Target environment:
+
+- Application: WordPress (self-hosted, local environment).
+- PHP version: 8.4.27.
+- Access level: WordPress Administrator.
+- Operating system: Unix-like (Linux).
+- PHP security configuration: "disable_functions" is enabled and commonly used OS command execution functions are disabled.
+- Objective: Assess whether PHP memory-corruption vulnerabilities can bypass "disable_functions" on this exact PHP version.
+
+I have identified three publicly documented research approaches involving PHP Use-After-Free (UAF) vulnerabilities.
+
+I want you to investigate these approaches independently, compare their exploitation mechanisms, identify their prerequisites, and determine whether they are applicable to PHP 8.4.27.
+
+Do not assume that a vulnerability affecting PHP 8.4.x necessarily affects PHP 8.4.27. Verify the exact version and relevant fixes.
+
+2. The Three Research Approaches
+
+Approach A: Serializable / "unserialize()" Reentrancy UAF
+
+Reference article:
+
+https://calif.io/research/php-uaf
+
+Title: Finding and Exploiting a 21-Year-Old Vulnerability in PHP – Calif.
+
+Research background:
+
+The vulnerability involves a missing "BG(serialize_lock)++" operation in "zend_user_unserialize()".
+
+The underlying issue is reentrant deserialization and shared "var_hash" state.
+
+General mechanism:
+
+1. An outer "unserialize()" operation maintains a "var_hash" table containing previously parsed values.
+2. A user-defined class implementing "Serializable" invokes another "unserialize()" inside its own "unserialize()" method.
+3. The nested operation modifies the inner object's property HashTable.
+4. HashTable resizing frees the previous "arData" allocation.
+5. References in the outer "var_hash" can still point to freed memory.
+6. A subsequent back-reference can access the stale memory.
+
+Research details:
+
+- Uses the "Serializable" interface.
+- Involves recursive "unserialize()" calls.
+- Exploits stale references in "var_hash".
+- The published local exploit demonstrates heap address disclosure, memory read primitives, fake object construction, and a "disable_functions" bypass.
+- The article also describes a remote exploitation variant.
+
+Important remote exploitation precondition:
+
+The target application must already load a class that:
+
+- Implements "Serializable".
+- Calls "unserialize()" recursively on inner data from its own "unserialize()" method.
+- Grows the inner object's property table afterward.
+
+The article explicitly states that this pattern is uncommon in real-world applications.
+
+Important version distinction:
+
+The published article demonstrates a local exploit on PHP 8.5.5. Its claim that the vulnerable code path has existed since PHP 5.1 must not be interpreted as proof that every PHP 8.4.27 build has been independently tested.
+
+Approach B: DateInterval / TimeAfterFree
+
+Reference repository:
+
+https://github.com/m0x41nos/TimeAfterFree
+
+Research background:
+
+This PoC demonstrates a PHP 8 sandbox escape through a UAF vulnerability associated with array destruction and specially constructed objects.
+
+The "DateInterval" internal class is used as an important exploitation component.
+
+General mechanism:
+
+1. Trigger a UAF condition during array/object destruction.
+2. Reclaim freed heap memory through controlled allocations.
+3. Use "DateInterval" object internals to assist with heap pointer disclosure.
+4. Develop memory read/write primitives.
+5. Use memory corruption to redirect execution through native PHP/runtime structures.
+6. Demonstrate OS command execution despite "disable_functions".
+
+Important distinction:
+
+"DateInterval" is not simply the name of the underlying UAF bug. It is an exploitation primitive/object used by the PoC.
+
+The repository claims compatibility with:
+
+- PHP 8.2.x
+- PHP 8.3.x
+- PHP 8.4.x
+- PHP 8.5.x
+
+It also claims testing across multiple standard PHP distributions and server APIs, including CLI, PHP-FPM, and Apache module.
+
+Investigate whether the published implementation actually works on PHP 8.4.27.
+
+Do not assume that the presence of the built-in "DateInterval" class guarantees exploitability.
+
+Approach C: Stringable / ZEND_FRAMELESS_FUNCTION UAF
+
+Reference article:
+
+https://e1abrador.com/posts/php-uaf-frameless-rce.html
+
+PoC repository:
+
+https://github.com/e1abrador/php-uaf-frameless-rce
+
+Title: PHP 8.4+ UAF via ZEND_FRAMELESS_FUNCTION: From Crash to disable_functions Bypass.
+
+Research background:
+
+PHP 8.4 introduced frameless function execution paths for performance-critical internal functions.
+
+Traditional function calls use VM argument handling that can increment reference counts.
+
+Frameless functions can directly access zval pointers without the same reference-count protection.
+
+General mechanism:
+
+1. A frameless internal function iterates an array.
+2. The array contains a custom object implementing "Stringable".
+3. The object executes user-defined code through "__toString()".
+4. The callback releases the array while the internal function is still iterating it.
+5. The array HashTable and its backing allocation can be freed.
+6. The internal function continues accessing freed memory.
+7. The resulting memory corruption can be turned into a "disable_functions" bypass.
+
+Important technical details:
+
+- The research identifies "preg_replace()" as an exploitable path.
+- The PoC uses "Stringable" objects to execute callbacks during array iteration.
+- The exploitation chain includes heap pointer disclosure, PHP binary base discovery, fake object construction, and native function dispatch.
+- The author discusses ELF symbol resolution and runtime offset discovery.
+
+Important prerequisites reported by the author:
+
+- PHP 8.4 or later.
+- OPcache enabled.
+- JIT disabled.
+- Dynamically linked PHP.
+- Read access to "/proc/self/maps".
+- Writable "/tmp".
+
+The author reports testing on PHP 8.4.10 and PHP 8.6.0-dev.
+
+The article also discusses fixes applied to "implode()", "strtr()", and "str_replace()", while identifying a similar issue in "preg_replace()".
+
+Investigate the exact status of this issue in PHP 8.4.27.
+
+Do not assume the entire vulnerability class was fixed just because some related functions were patched.
+
+---
+
+3. Required Comparative Analysis
+
+Create a detailed comparison table covering all three approaches.
+
+For each approach, identify:
+
+1. Root cause of the UAF.
+2. Relevant PHP internal functions.
+3. Relevant PHP internal objects or interfaces.
+4. Memory corruption mechanism.
+5. How the UAF is triggered.
+6. Whether heap pointer disclosure is required.
+7. Whether arbitrary memory read is required.
+8. Whether arbitrary memory write is required.
+9. Whether ASLR bypass is required.
+10. Whether PHP binary offsets are required.
+11. Whether libc offsets are required.
+12. Whether "/proc/self/maps" access is required.
+13. Whether OPcache is required.
+14. Whether JIT must be disabled.
+15. Whether dynamically linked PHP is required.
+16. Whether a specific SAPI is required.
+17. Whether the exploit is local-only or potentially remote.
+18. Whether a specific application-level gadget or class must already exist.
+19. Whether the published PoC supports PHP 8.4.27.
+20. Known limitations and mitigation options.
+
+Clearly distinguish between:
+
+- Required prerequisites.
+- Optional exploitation conveniences.
+- Environment-specific assumptions.
+- Information dynamically discovered by the exploit.
+- Information that must be known beforehand.
+
+4. PHP Information Gathering: What Can Be Queried Through a ".php" File?
+
+This is an important part of the research.
+
+I want to understand which environmental details can be obtained through ordinary PHP execution without shell access, and which require access to the PHP binary, native libraries, process memory, or debugging tools.
+
+Create a table with these columns:
+
+Information| PHP query possible?| Example API or method| Additional access required?
+
+Investigate at least the following:
+
+PHP Runtime
+
+- PHP version.
+- PHP SAPI.
+- PHP version ID.
+- PHP operating system.
+- PHP architecture.
+- PHP integer size.
+- Thread safety (ZTS/NTS).
+- PHP configuration file location.
+- Additional scanned INI files.
+- Loaded extensions.
+- Loaded PHP modules.
+- OPcache status.
+- JIT configuration.
+- "disable_functions".
+- "disable_classes".
+- "open_basedir".
+- "memory_limit".
+- Relevant configuration values.
+
+Native Environment
+
+- Whether PHP is dynamically or statically linked.
+- PHP binary path.
+- PHP binary ELF metadata.
+- libc implementation and version.
+- Loaded shared libraries.
+- Process memory mappings.
+- Whether "/proc/self/maps" is readable.
+- ASLR status.
+- PIE status.
+- Relevant symbol addresses.
+- Zend Memory Manager information.
+
+PHP Object and Engine Information
+
+- Whether "DateInterval" exists.
+- Whether "Stringable" exists.
+- Whether "Serializable" exists.
+- Whether relevant internal classes are available.
+- Whether OPcache uses a frameless execution path.
+- Whether the target application contains classes implementing "Serializable".
+- Whether application code calls "unserialize()" on externally controlled input.
+
+For each item, explain whether it can be discovered through:
+
+- Standard PHP functions.
+- "phpinfo()".
+- Reflection.
+- Reading accessible files.
+- PHP binary inspection.
+- Native debugging or process inspection.
+
+Important: Do not assume that "phpinfo()" exposes every relevant memory address or binary offset.
+
+Also distinguish between PHP configuration information and memory-layout information.
+
+5. Offset and Address Requirements
+
+Explain the difference between:
+
+- Heap address.
+- Heap offset.
+- PHP binary base address.
+- ELF symbol offset.
+- libc base address.
+- libc function offset.
+- Zend object property offset.
+- "zend_object_handlers" field offset.
+- Runtime function pointer.
+
+For each of the three approaches, identify:
+
+1. Which offsets are hardcoded, if any.
+2. Which offsets are dynamically resolved.
+3. Which addresses are leaked at runtime.
+4. Whether the exploit needs "/proc/self/maps".
+5. Whether the exploit can work without prior knowledge of the target's PHP binary layout.
+6. Whether a normal PHP script can discover the required information.
+
+Pay special attention to the distinction between the Calif Serializable exploit, which claims to work without "/proc" or hardcoded offsets in its local version, and the Frameless UAF exploit, which describes ELF parsing and "/proc/self/maps" access.
+
+Do not confuse "php.ini" configuration values with ELF offsets or Zend Engine memory offsets.
+
+6. Exact PHP 8.4.27 Compatibility Assessment
+
+This is the most important objective.
+
+For each approach, determine:
+
+- Is PHP 8.4.27 affected?
+- Is the underlying bug still present?
+- Has a relevant patch landed?
+- Does the patch cover the exact vulnerable code path?
+- Does the published PoC require modifications?
+- Are there known incompatible configurations?
+- Is there direct evidence of successful execution on PHP 8.4.27?
+
+Use primary sources whenever possible:
+
+- PHP source code.
+- PHP GitHub commits.
+- PHP changelogs.
+- Official security advisories.
+- Original researcher publications.
+- Original PoC repositories.
+
+Do not infer compatibility solely from a broad version range such as PHP 8.4.x.
+
+For every conclusion, assign one of these statuses:
+
+- Confirmed affected.
+- Confirmed fixed.
+- Likely affected, not independently verified.
+- Insufficient evidence.
+- Not applicable.
+
+Provide citations and explain the evidence behind each classification.
+
+7. WordPress-Specific Applicability
+
+My target is a local WordPress installation, and I have Administrator access.
+
+Analyze whether the three approaches are realistically applicable to this environment.
+
+Investigate:
+
+1. Whether WordPress core uses "unserialize()" on attacker-controlled input.
+2. Whether common WordPress plugins introduce suitable "Serializable" classes.
+3. Whether a WordPress Administrator can normally upload or execute arbitrary PHP files under the current configuration.
+4. Whether "disable_functions" affects WordPress plugin execution.
+5. Whether "disable_classes" would affect the DateInterval approach.
+6. Whether PHP-FPM, Apache mod_php, or CLI changes the exploit prerequisites.
+7. Whether OPcache configuration is relevant.
+8. Whether the WordPress application itself provides the required gadget or whether a separate PHP test harness is necessary.
+
+Distinguish between:
+
+- Running a standalone PHP PoC.
+- Triggering a vulnerability through a WordPress endpoint.
+- Exploiting a real application-level deserialization path.
+
+Do not assume WordPress Administrator access automatically implies arbitrary PHP code execution.
+
+8. Safe Validation and Research Plan
+
+The target is my own local environment.
+
+Propose a validation methodology that prioritizes:
+
+1. Environment fingerprinting.
+2. Source-code and patch verification.
+3. Checking the availability of required internal classes and interfaces.
+4. Checking relevant OPcache and JIT configuration.
+5. Identifying application-level prerequisites.
+6. Reproducing UAF conditions in an isolated lab.
+7. Using AddressSanitizer or equivalent instrumentation where practical.
+8. Recording crash traces and confirming whether the underlying UAF still exists.
+9. Separating vulnerability confirmation from successful command execution.
+
+Do not assume that a crash proves an exploitable UAF or that a successful local exploit proves remote exploitability.
+
+Keep validation isolated from the actual WordPress installation.
+
+9. Expected Deliverables
+
+Please produce the following:
+
+A. Executive Summary
+
+A concise explanation of the three approaches and their differences.
+
+B. Technical Comparison Table
+
+Compare all three approaches using the criteria in Section 3.
+
+C. PHP Fingerprinting Script
+
+Provide a safe, read-only PHP diagnostic script that gathers as much relevant environment information as possible.
+
+The script should:
+
+- Work on PHP 8.4.27.
+- Avoid executing OS commands.
+- Avoid modifying files.
+- Avoid exposing sensitive information unnecessarily.
+- Clearly label unavailable information.
+- Not falsely claim to retrieve memory offsets that standard PHP APIs cannot expose.
+
+D. Offset and Information Dependency Matrix
+
+Show which information can be queried through PHP, which can be derived from readable files, and which requires binary or runtime analysis.
+
+E. PHP 8.4.27 Compatibility Matrix
+
+Give an evidence-based assessment of all three approaches.
+
+F. Recommended Research Priority
+
+Rank the three approaches by:
+
+- Ease of reproducing the underlying bug.
+- Number of prerequisites.
+- Dependency on target-specific memory layout.
+- Compatibility uncertainty on PHP 8.4.27.
+- Relevance to a WordPress environment.
+
+G. References
+
+Provide direct links to original articles, repositories, source code, relevant commits, and official PHP documentation.
+
+---
+
+10. Research Accuracy Requirements
+
+Please follow these rules strictly:
+
+1. Do not conflate the three UAF vulnerabilities.
+2. Do not assume all UAF vulnerabilities are fixed by updating PHP to 8.4.27.
+3. Do not assume all PHP 8.4.x builds have identical exploitability.
+4. Do not claim that "DateInterval", "Stringable", or "Serializable" must be installed separately.
+5. Do not confuse PHP configuration files with native binary offsets.
+6. Do not assume PHP queries can disclose arbitrary runtime addresses.
+7. Distinguish local code execution from remote exploitation.
+8. Distinguish a PHP memory corruption bug from an application-level deserialization vulnerability.
+9. Clearly label unverified claims.
+10. Cite original sources rather than relying on secondary vulnerability summaries.
+
+The ultimate objective is to establish whether any of these three approaches is applicable to my exact PHP 8.4.27 environment and what information can be collected safely through PHP itself before conducting deeper binary and memory analysis.
